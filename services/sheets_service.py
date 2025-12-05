@@ -3,6 +3,7 @@ Google Sheets integration service
 """
 import json
 import logging
+import os
 from typing import Optional, List, Dict
 from datetime import datetime
 
@@ -12,27 +13,39 @@ logger = logging.getLogger(__name__)
 GSPREAD_AVAILABLE = False
 try:
     import gspread
-    from oauth2client.service_account import ServiceAccountCredentials
+    from google.oauth2.service_account import Credentials as ServiceAccountCredentials
+    from google.oauth2.credentials import Credentials as OAuth2Credentials
     GSPREAD_AVAILABLE = True
 except ImportError:
-    logger.warning("gspread or oauth2client not installed. Google Sheets integration disabled.")
+    logger.warning("gspread or google-auth not installed. Google Sheets integration disabled.")
 
 
 class SheetsService:
     """Service for exporting voting results to Google Sheets"""
 
-    def __init__(self, credentials_path: Optional[str] = None):
+    def __init__(self, credentials_path: Optional[str] = None, folder_id: Optional[str] = None, use_oauth: bool = None):
         """
         Initialize Google Sheets service
 
         Args:
-            credentials_path: Path to service account credentials JSON file
+            credentials_path: Path to credentials JSON file (service account or OAuth token)
+            folder_id: Google Drive folder ID where spreadsheets will be created
+            use_oauth: If True, use OAuth2 token.json; if False, use service account credentials.json
+                      If None, auto-detect based on available files.
         """
-        self.credentials_path = credentials_path or "credentials.json"
+        # Determine authentication method
+        if use_oauth is None:
+            # Auto-detect: prefer OAuth token if available
+            use_oauth = os.path.exists("token.json")
+
+        self.use_oauth = use_oauth
+        self.credentials_path = credentials_path or ("token.json" if use_oauth else "credentials.json")
+        self.folder_id = folder_id or os.getenv("GOOGLE_DRIVE_FOLDER_ID")
         self.client = None
 
         if GSPREAD_AVAILABLE and self._initialize_client():
-            logger.info("Google Sheets service initialized successfully")
+            auth_method = "OAuth2" if self.use_oauth else "Service Account"
+            logger.info(f"Google Sheets service initialized with {auth_method} (folder_id: {self.folder_id})")
         else:
             logger.warning("Google Sheets service not available")
 
@@ -40,14 +53,25 @@ class SheetsService:
         """Initialize gspread client with credentials"""
         try:
             scope = [
-                'https://spreadsheets.google.com/feeds',
-                'https://www.googleapis.com/auth/drive'
+                'https://www.googleapis.com/auth/spreadsheets',
+                'https://www.googleapis.com/auth/drive.file'
             ]
 
-            creds = ServiceAccountCredentials.from_json_keyfile_name(
-                self.credentials_path,
-                scope
-            )
+            if self.use_oauth:
+                # Use OAuth2 token from user account
+                logger.info(f"Loading OAuth2 credentials from {self.credentials_path}")
+                creds = OAuth2Credentials.from_authorized_user_file(
+                    self.credentials_path,
+                    scopes=scope
+                )
+            else:
+                # Use service account credentials
+                logger.info(f"Loading Service Account credentials from {self.credentials_path}")
+                creds = ServiceAccountCredentials.from_service_account_file(
+                    self.credentials_path,
+                    scopes=scope
+                )
+
             self.client = gspread.authorize(creds)
             return True
         except Exception as e:
@@ -92,8 +116,8 @@ class SheetsService:
             sheet_name = spreadsheet_name or f"Голосование #{voting_id}: {voting_title}"
 
             try:
-                spreadsheet = self.client.create(sheet_name)
-                logger.info(f"Created new spreadsheet: {sheet_name}")
+                spreadsheet = self.client.create(sheet_name, folder_id=self.folder_id)
+                logger.info(f"Created new spreadsheet: {sheet_name} in folder {self.folder_id}")
             except Exception as e:
                 logger.error(f"Failed to create spreadsheet: {e}")
                 return None
@@ -217,15 +241,27 @@ class SheetsService:
             sheet_name = spreadsheet_name or "Реестр членов ассоциации КП Лазурный"
 
             try:
-                # Try to open existing spreadsheet
-                spreadsheet = self.client.open(sheet_name)
-                logger.info(f"Opened existing spreadsheet: {sheet_name}")
-                worksheet = spreadsheet.sheet1
-                worksheet.clear()
+                # Try to open existing spreadsheet in the folder
+                if self.folder_id:
+                    # Search for the spreadsheet in the specific folder
+                    files = self.client.list_spreadsheet_files(folder_id=self.folder_id)
+                    matching_file = next((f for f in files if f['name'] == sheet_name), None)
+                    if matching_file:
+                        spreadsheet = self.client.open_by_key(matching_file['id'])
+                        logger.info(f"Opened existing spreadsheet: {sheet_name}")
+                        worksheet = spreadsheet.sheet1
+                        worksheet.clear()
+                    else:
+                        raise FileNotFoundError("Spreadsheet not found in folder")
+                else:
+                    spreadsheet = self.client.open(sheet_name)
+                    logger.info(f"Opened existing spreadsheet: {sheet_name}")
+                    worksheet = spreadsheet.sheet1
+                    worksheet.clear()
             except:
                 # Create new if doesn't exist
-                spreadsheet = self.client.create(sheet_name)
-                logger.info(f"Created new spreadsheet: {sheet_name}")
+                spreadsheet = self.client.create(sheet_name, folder_id=self.folder_id)
+                logger.info(f"Created new spreadsheet: {sheet_name} in folder {self.folder_id}")
                 worksheet = spreadsheet.sheet1
 
             worksheet.update_title("Реестр")

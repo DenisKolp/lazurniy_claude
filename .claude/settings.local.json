@@ -23,7 +23,14 @@
       "Bash(git push:*)",
       "Bash(git rm:*)",
       "Bash(git filter-branch:*)",
-      "Bash(git checkout:*)"
+      "Bash(git checkout:*)",
+      "Bash(dir:*)",
+      "Bash(where:*)",
+      "Bash(C:/Users/den/AppData/Local/Microsoft/WindowsApps/python.exe c:/Users/den/lazurny_bot/test_sheets.py)",
+      "Bash(py:*)",
+      "Bash(powershell.exe -Command \"python --version\")",
+      "Bash(docker system prune:*)",
+      "Bash(del token.json)"
     ],
     "deny": [],
     "ask": []

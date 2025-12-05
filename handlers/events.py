@@ -254,8 +254,7 @@ async def event_receive_location(update: Update, context: ContextTypes.DEFAULT_T
                         text=f"📅 Новое событие в календаре!\n\n"
                              f"*{event.title}*\n\n"
                              f"📍 {event.location or 'Место не указано'}\n"
-                             f"🕐 {event_date_str}\n\n"
-                             f"Используйте команду /events для подробностей.",
+                             f"🕐 {event_date_str}",
                         parse_mode='Markdown'
                     )
                 except Exception:

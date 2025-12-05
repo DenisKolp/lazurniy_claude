@@ -27,7 +27,7 @@ EMERGENCY_MESSAGE, TICKET_RESPONSE, REJECT_REASON = range(3)
 async def safe_answer_query(query):
     """Safely answer callback query, ignoring timeout errors"""
     try:
-        await safe_answer_query(query)
+        await query.answer()
     except Exception:
         pass  # Query too old or other error
 
@@ -235,10 +235,9 @@ async def admin_user_view_callback(update: Update, context: ContextTypes.DEFAULT
 async def admin_approve_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Approve user verification"""
     query = update.callback_query
-    try:
-        await safe_answer_query(query)
-    except Exception:
-        pass  # Query too old
+
+    # Show immediate feedback
+    await query.answer("⏳ Обрабатываю заявку...", show_alert=False)
 
     user_id = int(query.data.split("_")[2])
 
@@ -365,11 +364,11 @@ async def admin_revoke_callback(update: Update, context: ContextTypes.DEFAULT_TY
             await query.answer("❌ Пользователь не найден.", show_alert=True)
             return
 
-        # Update user status back to pending
+        # Update user status to rejected (remove access immediately)
         await UserCRUD.update(
             session,
             user,
-            status=UserStatus.PENDING,
+            status=UserStatus.REJECTED,
             verified_at=None
         )
 
@@ -378,12 +377,12 @@ async def admin_revoke_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await context.bot.send_message(
             chat_id=user.telegram_id,
             text="⚠️ Ваша верификация была отозвана администратором.\n\n"
-                 "Для получения доступа к функциям бота необходимо пройти верификацию повторно."
+                 "Доступ к функциям бота был удалён. Для восстановления доступа необходимо пройти верификацию повторно через /verify."
         )
     except Exception:
         pass  # User might have blocked the bot
 
-    await query.answer("✅ Верификация пользователя удалена.", show_alert=True)
+    await query.answer("✅ Верификация удалена. Доступ пользователя заблокирован.", show_alert=True)
     await admin_users_verified_callback(update, context)
 
 

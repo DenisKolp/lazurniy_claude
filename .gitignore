@@ -38,6 +38,8 @@ ENV/
 
 # Google Sheets credentials
 credentials.json
+oauth_credentials.json
+token.json
 
 # Database
 *.db

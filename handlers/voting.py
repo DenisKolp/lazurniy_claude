@@ -13,7 +13,12 @@ from database.session import async_session_maker
 from utils.validators import validate_title, validate_description, validate_voting_options
 from utils.helpers import format_datetime, calculate_quorum, format_voting_results, get_user_display_name
 from config import config
+from services.sheets_service import sheets_service
 import json
+import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 # Conversation states
@@ -36,19 +41,17 @@ async def voting_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text = "🗳️ *Голосования*\n\n"
         if active_votings:
-            text += "Активные голосования:\n\n"
+            text += "Активные вопросы:\n\n"
             for voting in active_votings:
                 ends_at = format_datetime(voting.ends_at)
                 text += f"• {voting.title}\n"
                 text += f"  Завершается: {ends_at}\n\n"
         else:
-            text += "Нет активных голосований.\n\n"
+            text += "Нет активных вопросов.\n\n"
 
         keyboard = [
-            [InlineKeyboardButton("📊 Просмотреть активные", callback_data="voting_list")],
-            [InlineKeyboardButton("➕ Предложить вопрос", callback_data="voting_propose")],
-            [InlineKeyboardButton("📈 Мои вопросы", callback_data="voting_my")],
-            [InlineKeyboardButton("📜 История голосований", callback_data="voting_history")]
+            [InlineKeyboardButton("📊 Просмотреть активные вопросы", callback_data="voting_list")],
+            [InlineKeyboardButton("➕ Предложить вопрос", callback_data="voting_propose")]
         ]
 
         if user.is_admin:
@@ -58,33 +61,114 @@ async def voting_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
 
 
-async def voting_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show list of active votings"""
+async def voting_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show voting menu (callback version)"""
     query = update.callback_query
     await query.answer()
+
+    async with async_session_maker() as session:
+        user = await UserCRUD.get_by_telegram_id(session, update.effective_user.id)
+
+        if not user or user.status != UserStatus.VERIFIED:
+            await query.edit_message_text(
+                "❌ Доступ запрещен. Пройдите верификацию (/verify)."
+            )
+            return
+
+        active_votings = await VotingCRUD.get_active(session)
+
+        text = "🗳️ *Голосования*\n\n"
+        if active_votings:
+            text += "Активные вопросы:\n\n"
+            for voting in active_votings:
+                ends_at = format_datetime(voting.ends_at)
+                text += f"• {voting.title}\n"
+                text += f"  Завершается: {ends_at}\n\n"
+        else:
+            text += "Нет активных вопросов.\n\n"
+
+        keyboard = [
+            [InlineKeyboardButton("📊 Просмотреть активные вопросы", callback_data="voting_list")],
+            [InlineKeyboardButton("➕ Предложить вопрос", callback_data="voting_propose")]
+        ]
+
+        if user.is_admin:
+            keyboard.append([InlineKeyboardButton("👨‍💼 Создать голосование", callback_data="voting_create")])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+
+
+async def voting_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show all active votings as separate messages"""
+    query = update.callback_query
+    await query.answer()
+
+    # Delete the menu message
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
 
     async with async_session_maker() as session:
         active_votings = await VotingCRUD.get_active(session)
 
         if not active_votings:
-            await query.edit_message_text("Нет активных голосований.")
+            await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text="Нет активных вопросов."
+            )
             return
 
-        keyboard = []
-        for voting in active_votings:
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"📊 {voting.title[:40]}...",
-                    callback_data=f"voting_view_{voting.id}"
-                )
-            ])
-        keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="voting_menu")])
+        user = await UserCRUD.get_by_telegram_id(session, query.from_user.id)
 
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(
-            "Выберите голосование:",
-            reply_markup=reply_markup
-        )
+        # Send each voting as a separate message
+        for voting in active_votings:
+            # Check if user already voted
+            existing_vote = await VoteCRUD.get_user_vote(session, user.id, voting.id)
+
+            # Get current results
+            results = await VoteCRUD.get_voting_results(session, voting.id)
+            total_votes = await VoteCRUD.count_votes(session, voting.id)
+
+            options = json.loads(voting.options) if isinstance(voting.options, str) else voting.options
+
+            text = f"📊 *{voting.title}*\n\n"
+            text += f"{voting.description}\n\n"
+            text += f"Завершается: {format_datetime(voting.ends_at)}\n"
+            text += f"Всего голосов: {total_votes}\n\n"
+
+            if existing_vote is not None:
+                text += f"✅ Вы проголосовали за вариант: {options[existing_vote.option_index]}\n\n"
+
+            text += "*Варианты ответов:*\n"
+            for i, option in enumerate(options):
+                votes = results.get(i, 0)
+                percent = (votes / total_votes * 100) if total_votes > 0 else 0
+                text += f"{i+1}. {option} - {votes} ({percent:.1f}%)\n"
+
+            keyboard = []
+            if existing_vote is None and voting.status == VotingStatus.ACTIVE:
+                for i, option in enumerate(options):
+                    keyboard.append([
+                        InlineKeyboardButton(
+                            f"✓ {option}",
+                            callback_data=f"vote_cast_{voting.id}_{i}"
+                        )
+                    ])
+
+            # Add manual end voting button for admins
+            if user.is_admin and voting.status == VotingStatus.ACTIVE:
+                keyboard.append([InlineKeyboardButton("⏹️ Завершить голосование", callback_data=f"voting_end_{voting.id}")])
+
+            reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+
+            await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
 
 
 async def voting_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -135,6 +219,10 @@ async def voting_view_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                     )
                 ])
 
+        # Add manual end voting button for admins
+        if user.is_admin and voting.status == VotingStatus.ACTIVE:
+            keyboard.append([InlineKeyboardButton("⏹️ Завершить голосование", callback_data=f"voting_end_{voting_id}")])
+
         keyboard.append([InlineKeyboardButton("◀️ Назад к списку", callback_data="voting_list")])
 
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -179,8 +267,119 @@ async def vote_cast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         options = json.loads(voting.options) if isinstance(voting.options, str) else voting.options
         await query.answer(f"✅ Ваш голос учтен: {options[option_index]}", show_alert=True)
 
-        # Refresh view
-        await voting_view_callback(update, context)
+        # Update the message with new results
+        results = await VoteCRUD.get_voting_results(session, voting_id)
+        total_votes = await VoteCRUD.count_votes(session, voting_id)
+
+        text = f"📊 *{voting.title}*\n\n"
+        text += f"{voting.description}\n\n"
+        text += f"Завершается: {format_datetime(voting.ends_at)}\n"
+        text += f"Всего голосов: {total_votes}\n\n"
+        text += f"✅ Вы проголосовали за вариант: {options[option_index]}\n\n"
+        text += "*Варианты ответов:*\n"
+        for i, option in enumerate(options):
+            votes = results.get(i, 0)
+            percent = (votes / total_votes * 100) if total_votes > 0 else 0
+            text += f"{i+1}. {option} - {votes} ({percent:.1f}%)\n"
+
+        # Only show end button for admins
+        keyboard = []
+        if user.is_admin and voting.status == VotingStatus.ACTIVE:
+            keyboard.append([InlineKeyboardButton("⏹️ Завершить голосование", callback_data=f"voting_end_{voting_id}")])
+
+        reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+
+
+async def voting_end_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually end an active voting (admin only)"""
+    query = update.callback_query
+    await query.answer()
+
+    voting_id = int(query.data.split("_")[2])
+
+    async with async_session_maker() as session:
+        user = await UserCRUD.get_by_telegram_id(session, query.from_user.id)
+
+        # Check admin rights
+        if not user or not user.is_admin:
+            await query.answer("❌ Доступ запрещен.", show_alert=True)
+            return
+
+        voting = await VotingCRUD.get_by_id(session, voting_id)
+        if not voting:
+            await query.answer("❌ Голосование не найдено.", show_alert=True)
+            return
+
+        if voting.status != VotingStatus.ACTIVE:
+            await query.answer("❌ Голосование уже завершено.", show_alert=True)
+            return
+
+        # Get results
+        results = await VoteCRUD.get_voting_results(session, voting_id)
+        total_votes = await VoteCRUD.count_votes(session, voting_id)
+
+        # Update voting status
+        await VotingCRUD.update(
+            session,
+            voting,
+            status=VotingStatus.COMPLETED,
+            results=results,
+            total_votes=total_votes
+        )
+
+        options = json.loads(voting.options) if isinstance(voting.options, str) else voting.options
+
+        # Export to Google Sheets
+        sheets_url = None
+        try:
+            sheets_url = await sheets_service.export_voting_results(
+                voting_id=voting.id,
+                voting_title=voting.title,
+                voting_description=voting.description or "",
+                options=options,
+                results=results,
+                total_votes=total_votes,
+                created_at=voting.created_at,
+                ends_at=voting.ends_at
+            )
+        except Exception as e:
+            logger.error(f"Failed to export voting results: {e}")
+
+        # Prepare results message
+        message = f"📊 *Голосование завершено*\n\n"
+        message += f"*{voting.title}*\n\n"
+        message += f"Всего голосов: {total_votes}\n\n"
+        message += "*Результаты:*\n"
+
+        for i, option in enumerate(options):
+            votes = results.get(i, 0)
+            percent = (votes / total_votes * 100) if total_votes > 0 else 0
+            message += f"{i+1}. {option}: {votes} ({percent:.1f}%)\n"
+
+        if sheets_url:
+            message += f"\n📄 [Просмотреть детальные результаты]({sheets_url})"
+
+        # Send results to all verified users
+        verified_users = await UserCRUD.get_all_verified(session)
+        sent_count = 0
+        for u in verified_users:
+            if u.notifications_enabled:
+                try:
+                    await context.bot.send_message(
+                        chat_id=u.telegram_id,
+                        text=message,
+                        parse_mode='Markdown'
+                    )
+                    sent_count += 1
+                    await asyncio.sleep(0.1)
+                except Exception as e:
+                    logger.error(f"Failed to send results to {u.telegram_id}: {e}")
+
+        await query.answer(f"✅ Голосование завершено. Результаты отправлены {sent_count} пользователям.", show_alert=True)
+
+        # Update message to show completed status
+        await query.edit_message_text(message, parse_mode='Markdown')
 
 
 async def voting_create_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -552,12 +751,15 @@ def register_voting_handlers(application):
     ))
 
     # Callbacks
+    application.add_handler(CallbackQueryHandler(voting_menu_callback, pattern="^voting_menu$"))
     application.add_handler(CallbackQueryHandler(voting_list_callback, pattern="^voting_list$"))
     application.add_handler(CallbackQueryHandler(voting_view_callback, pattern="^voting_view_"))
     application.add_handler(CallbackQueryHandler(vote_cast_callback, pattern="^vote_cast_"))
+    application.add_handler(CallbackQueryHandler(voting_end_callback, pattern="^voting_end_"))
     application.add_handler(CallbackQueryHandler(voting_create_start, pattern="^voting_create$"))
-    application.add_handler(CallbackQueryHandler(voting_my_callback, pattern="^voting_my$"))
-    application.add_handler(CallbackQueryHandler(voting_history_callback, pattern="^voting_history$"))
+    # Removed: voting_my and voting_history - not needed by users
+    # application.add_handler(CallbackQueryHandler(voting_my_callback, pattern="^voting_my$"))
+    # application.add_handler(CallbackQueryHandler(voting_history_callback, pattern="^voting_history$"))
     application.add_handler(CallbackQueryHandler(voting_back_callback, pattern="^voting_back$"))
 
     # Create voting conversation

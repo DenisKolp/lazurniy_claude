@@ -57,6 +57,48 @@ async def tickets_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
 
 
+async def tickets_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show tickets menu (callback version)"""
+    query = update.callback_query
+    await query.answer()
+
+    async with async_session_maker() as session:
+        user = await UserCRUD.get_by_telegram_id(session, query.from_user.id)
+
+        if not user or user.status != UserStatus.VERIFIED:
+            await query.edit_message_text(
+                "❌ Доступ запрещен. Пройдите верификацию."
+            )
+            return
+
+        user_tickets = await TicketCRUD.get_user_tickets(session, user.id)
+
+        text = "📝 *Обращение в ИГ*\n\n"
+        if user_tickets:
+            text += "Ваши обращения:\n\n"
+            for ticket in user_tickets[:5]:
+                created = format_datetime(ticket.created_at, "%d.%m.%Y")
+                status_emoji = {
+                    TicketStatus.NEW: "🆕",
+                    TicketStatus.IN_PROGRESS: "⏳",
+                    TicketStatus.ANSWERED: "✅",
+                    TicketStatus.CLOSED: "✔️"
+                }.get(ticket.status, "❓")
+
+                text += f"{status_emoji} {ticket.title[:40]}\n"
+                text += f"  Создано: {created}\n\n"
+        else:
+            text += "У вас пока нет обращений.\n\n"
+
+        keyboard = [
+            [InlineKeyboardButton("📋 Мои обращения", callback_data="tickets_my")],
+            [InlineKeyboardButton("➕ Создать обращение", callback_data="ticket_create")],
+        ]
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+
+
 async def tickets_my_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show user's tickets"""
     query = update.callback_query
@@ -295,6 +337,7 @@ def register_tickets_handlers(application):
     ))
 
     # Callbacks
+    application.add_handler(CallbackQueryHandler(tickets_menu_callback, pattern="^tickets_menu$"))
     application.add_handler(CallbackQueryHandler(tickets_my_callback, pattern="^tickets_my$"))
     application.add_handler(CallbackQueryHandler(ticket_view_callback, pattern="^ticket_view_"))
 

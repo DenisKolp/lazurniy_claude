@@ -28,6 +28,8 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+      - ./credentials.json:/app/credentials.json:ro
+      - ./token.json:/app/token.json:ro
     environment:
       - DATABASE_URL=postgresql+asyncpg://lazurny_user:${POSTGRES_PASSWORD:-lazurny_secure_pass_2024}@postgres:5432/lazurny_bot
     networks:
