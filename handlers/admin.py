@@ -372,6 +372,25 @@ async def admin_revoke_callback(update: Update, context: ContextTypes.DEFAULT_TY
             verified_at=None
         )
 
+        # Update registry in Google Sheets (remove this user)
+        try:
+            verified_users = await UserCRUD.get_all_verified(session)
+            members_data = []
+            for member in verified_users:
+                members_data.append({
+                    'full_name': member.full_name,
+                    'username': member.username,
+                    'phone_number': member.phone_number,
+                    'address': member.address,
+                    'verified_at': format_datetime(member.verified_at, '%d.%m.%Y %H:%M') if member.verified_at else 'Не указана'
+                })
+
+            registry_url = await sheets_service.export_members_registry(members_data)
+            if registry_url:
+                logger.info(f"Registry updated (user removed) in Google Sheets: {registry_url}")
+        except Exception as e:
+            logger.error(f"Failed to update registry: {e}")
+
     # Notify user
     try:
         await context.bot.send_message(
@@ -720,10 +739,8 @@ async def admin_voting_draft_view_callback(update: Update, context: ContextTypes
         text += f"Создано: {created}\n"
 
         keyboard = [
-            [
-                InlineKeyboardButton("✅ Опубликовать", callback_data=f"admin_voting_publish_{voting_id}"),
-                InlineKeyboardButton("❌ Отклонить", callback_data=f"admin_voting_reject_{voting_id}")
-            ],
+            [InlineKeyboardButton("✅ Опубликовать", callback_data=f"admin_voting_publish_duration_{voting_id}")],
+            [InlineKeyboardButton("❌ Отклонить", callback_data=f"admin_voting_reject_{voting_id}")],
             [InlineKeyboardButton("◀️ Назад", callback_data="admin_votings_draft")]
         ]
 
@@ -767,12 +784,38 @@ async def admin_voting_active_view_callback(update: Update, context: ContextType
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
 
 
+async def admin_voting_publish_duration_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show duration options for publishing voting"""
+    query = update.callback_query
+    await query.answer()
+
+    voting_id = int(query.data.split("_")[-1])
+
+    keyboard = [
+        [InlineKeyboardButton("📅 3 дня", callback_data=f"admin_voting_publish_{voting_id}_3")],
+        [InlineKeyboardButton("📅 7 дней", callback_data=f"admin_voting_publish_{voting_id}_7")],
+        [InlineKeyboardButton("📅 14 дней", callback_data=f"admin_voting_publish_{voting_id}_14")],
+        [InlineKeyboardButton("📅 30 дней", callback_data=f"admin_voting_publish_{voting_id}_30")],
+        [InlineKeyboardButton("◀️ Назад", callback_data=f"admin_voting_draft_{voting_id}")]
+    ]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(
+        "Выберите срок голосования:",
+        reply_markup=reply_markup
+    )
+
+
 async def admin_voting_publish_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Publish (approve) draft voting"""
     query = update.callback_query
-    await safe_answer_query(query)
 
-    voting_id = int(query.data.split("_")[-1])
+    # Show immediate feedback
+    await query.answer("⏳ Публикую вопрос и отправляю уведомления...", show_alert=False)
+
+    parts = query.data.split("_")
+    voting_id = int(parts[3])
+    duration_days = int(parts[4])
 
     async with async_session_maker() as session:
         voting = await VotingCRUD.get_by_id(session, voting_id)
@@ -782,7 +825,7 @@ async def admin_voting_publish_callback(update: Update, context: ContextTypes.DE
 
         # Update status to ACTIVE and set proper dates
         starts_at = datetime.utcnow()
-        ends_at = starts_at + timedelta(days=config.VOTE_DURATION_DAYS)
+        ends_at = starts_at + timedelta(days=duration_days)
 
         await VotingCRUD.update(
             session,
@@ -998,6 +1041,7 @@ def register_admin_handlers(application):
     application.add_handler(CallbackQueryHandler(admin_votings_active_callback, pattern="^admin_votings_active$"))
     application.add_handler(CallbackQueryHandler(admin_voting_draft_view_callback, pattern="^admin_voting_draft_"))
     application.add_handler(CallbackQueryHandler(admin_voting_active_view_callback, pattern="^admin_voting_active_"))
+    application.add_handler(CallbackQueryHandler(admin_voting_publish_duration_callback, pattern="^admin_voting_publish_duration_"))
     application.add_handler(CallbackQueryHandler(admin_voting_publish_callback, pattern="^admin_voting_publish_"))
     application.add_handler(CallbackQueryHandler(admin_voting_reject_callback, pattern="^admin_voting_reject_"))
     application.add_handler(CallbackQueryHandler(admin_voting_delete_callback, pattern="^admin_voting_delete_"))

@@ -54,8 +54,7 @@ async def voting_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("➕ Предложить вопрос", callback_data="voting_propose")]
         ]
 
-        if user.is_admin:
-            keyboard.append([InlineKeyboardButton("👨‍💼 Создать голосование", callback_data="voting_create")])
+        # Removed: Create voting button (admin uses voting propose and approves it)
 
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
@@ -92,8 +91,7 @@ async def voting_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             [InlineKeyboardButton("➕ Предложить вопрос", callback_data="voting_propose")]
         ]
 
-        if user.is_admin:
-            keyboard.append([InlineKeyboardButton("👨‍💼 Создать голосование", callback_data="voting_create")])
+        # Removed: Create voting button (admin uses voting propose and approves it)
 
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
@@ -148,7 +146,8 @@ async def voting_list_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 text += f"{i+1}. {option} - {votes} ({percent:.1f}%)\n"
 
             keyboard = []
-            if existing_vote is None and voting.status == VotingStatus.ACTIVE:
+            # Allow voting/revoting if voting is active
+            if voting.status == VotingStatus.ACTIVE:
                 for i, option in enumerate(options):
                     keyboard.append([
                         InlineKeyboardButton(
@@ -246,19 +245,19 @@ async def vote_cast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await query.answer("❌ Голосование не активно.", show_alert=True)
             return
 
-        # Check if already voted
+        # Check if already voted - if yes, update the vote
         existing_vote = await VoteCRUD.get_user_vote(session, user.id, voting_id)
         if existing_vote:
-            await query.answer("❌ Вы уже проголосовали!", show_alert=True)
-            return
-
-        # Create vote
-        await VoteCRUD.create(
-            session,
-            user_id=user.id,
-            voting_id=voting_id,
-            option_index=option_index
-        )
+            # Update existing vote
+            await VoteCRUD.update(session, existing_vote, option_index=option_index)
+        else:
+            # Create new vote
+            await VoteCRUD.create(
+                session,
+                user_id=user.id,
+                voting_id=voting_id,
+                option_index=option_index
+            )
 
         # Update voting
         total_votes = await VoteCRUD.count_votes(session, voting_id)
@@ -282,8 +281,17 @@ async def vote_cast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             percent = (votes / total_votes * 100) if total_votes > 0 else 0
             text += f"{i+1}. {option} - {votes} ({percent:.1f}%)\n"
 
-        # Only show end button for admins
+        # Show voting buttons (allow revoting) and end button for admins
         keyboard = []
+        if voting.status == VotingStatus.ACTIVE:
+            for i, option in enumerate(options):
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"✓ {option}",
+                        callback_data=f"vote_cast_{voting_id}_{i}"
+                    )
+                ])
+
         if user.is_admin and voting.status == VotingStatus.ACTIVE:
             keyboard.append([InlineKeyboardButton("⏹️ Завершить голосование", callback_data=f"voting_end_{voting_id}")])
 
