@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: lazurny_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: lazurny_bot
+      POSTGRES_USER: lazurny_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lazurny_secure_pass_2024}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - bot_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lazurny_user -d lazurny_bot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  bot:
+    build: .
+    container_name: lazurny_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://lazurny_user:${POSTGRES_PASSWORD:-lazurny_secure_pass_2024}@postgres:5432/lazurny_bot
+    networks:
+      - bot_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+networks:
+  bot_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
