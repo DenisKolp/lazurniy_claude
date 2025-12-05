@@ -21,7 +21,7 @@ from datetime import timedelta
 
 
 # Conversation states
-EMERGENCY_MESSAGE, TICKET_RESPONSE, REJECT_REASON = range(3)
+EMERGENCY_MESSAGE, TICKET_RESPONSE, REJECT_REASON, CUSTOM_VOTING_DURATION = range(4)
 
 
 async def safe_answer_query(query):
@@ -449,43 +449,64 @@ async def admin_ticket_view_callback(update: Update, context: ContextTypes.DEFAU
     query = update.callback_query
     await safe_answer_query(query)
 
-    # Extract ticket_id from callback_data: admin_ticket_123
-    parts = query.data.split("_")
-    ticket_id = int(parts[-1])
+    try:
+        # Extract ticket_id from callback_data: admin_ticket_123
+        parts = query.data.split("_")
+        ticket_id = int(parts[-1])
 
-    async with async_session_maker() as session:
-        ticket = await TicketCRUD.get_by_id(session, ticket_id)
-        if not ticket:
-            await query.answer("❌ Обращение не найдено.", show_alert=True)
-            return
+        logger.info(f"Admin viewing ticket #{ticket_id}")
 
-        user_name = get_user_display_name(ticket.user)
-        created = format_datetime(ticket.created_at, "%d.%m.%Y %H:%M")
+        async with async_session_maker() as session:
+            ticket = await TicketCRUD.get_by_id(session, ticket_id)
+            if not ticket:
+                logger.warning(f"Ticket #{ticket_id} not found")
+                await query.edit_message_text(
+                    "❌ Обращение не найдено.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("◀️ Назад", callback_data="admin_tickets")
+                    ]])
+                )
+                return
 
-        text = f"📝 *Обращение #{ticket.id}*\n\n"
-        text += f"От: {user_name}\n"
-        text += f"Дата: {created}\n\n"
-        text += f"*{ticket.title}*\n\n"
-        text += f"{ticket.description}\n"
+            user_name = get_user_display_name(ticket.user)
+            created = format_datetime(ticket.created_at, "%d.%m.%Y %H:%M")
 
-        keyboard = [
-            [InlineKeyboardButton("💬 Ответить", callback_data=f"admin_respond_{ticket.id}")],
-            [InlineKeyboardButton("✅ Закрыть", callback_data=f"admin_close_{ticket.id}")],
-            [InlineKeyboardButton("◀️ Назад", callback_data="admin_tickets")]
-        ]
+            text = f"📝 *Обращение #{ticket.id}*\n\n"
+            text += f"От: {user_name}\n"
+            text += f"Дата: {created}\n\n"
+            text += f"*{ticket.title}*\n\n"
+            text += f"{ticket.description}\n"
 
-        reply_markup = InlineKeyboardMarkup(keyboard)
+            keyboard = [
+                [InlineKeyboardButton("💬 Ответить", callback_data=f"admin_respond_{ticket.id}")],
+                [InlineKeyboardButton("✅ Закрыть", callback_data=f"admin_close_{ticket.id}")],
+                [InlineKeyboardButton("◀️ Назад", callback_data="admin_tickets")]
+            ]
 
-        # Send attachments if available
-        if ticket.attachments:
-            try:
-                attachments = json.loads(ticket.attachments)
-                for file_id in attachments:
-                    await context.bot.send_document(chat_id=query.message.chat_id, document=file_id)
-            except Exception:
-                pass
+            reply_markup = InlineKeyboardMarkup(keyboard)
 
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+            # Send attachments if available
+            if ticket.attachments:
+                try:
+                    attachments = json.loads(ticket.attachments)
+                    for file_id in attachments:
+                        await context.bot.send_document(chat_id=query.message.chat_id, document=file_id)
+                except Exception as e:
+                    logger.error(f"Failed to send attachments: {e}")
+
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+            logger.info(f"Successfully displayed ticket #{ticket_id}")
+    except Exception as e:
+        logger.error(f"Error in admin_ticket_view_callback: {e}", exc_info=True)
+        try:
+            await query.edit_message_text(
+                "❌ Произошла ошибка при загрузке обращения.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("◀️ Назад", callback_data="admin_tickets")
+                ]])
+            )
+        except Exception:
+            pass
 
 
 async def admin_respond_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -796,6 +817,7 @@ async def admin_voting_publish_duration_callback(update: Update, context: Contex
         [InlineKeyboardButton("📅 7 дней", callback_data=f"admin_voting_publish_{voting_id}_7")],
         [InlineKeyboardButton("📅 14 дней", callback_data=f"admin_voting_publish_{voting_id}_14")],
         [InlineKeyboardButton("📅 30 дней", callback_data=f"admin_voting_publish_{voting_id}_30")],
+        [InlineKeyboardButton("✏️ Указать свой срок", callback_data=f"admin_voting_custom_duration_{voting_id}")],
         [InlineKeyboardButton("◀️ Назад", callback_data=f"admin_voting_draft_{voting_id}")]
     ]
 
@@ -804,6 +826,124 @@ async def admin_voting_publish_duration_callback(update: Update, context: Contex
         "Выберите срок голосования:",
         reply_markup=reply_markup
     )
+
+
+async def admin_voting_custom_duration_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start custom duration input"""
+    query = update.callback_query
+    await query.answer()
+
+    voting_id = int(query.data.split("_")[-1])
+    context.user_data['custom_duration_voting_id'] = voting_id
+
+    await query.edit_message_text(
+        "Введите количество дней для голосования (от 1 до 90):"
+    )
+    return CUSTOM_VOTING_DURATION
+
+
+async def admin_voting_custom_duration_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive custom duration"""
+    try:
+        days = int(update.message.text.strip())
+        if days < 1 or days > 90:
+            await update.message.reply_text(
+                "❌ Пожалуйста, введите число от 1 до 90:"
+            )
+            return CUSTOM_VOTING_DURATION
+
+        voting_id = context.user_data.get('custom_duration_voting_id')
+        if not voting_id:
+            await update.message.reply_text("❌ Ошибка. Попробуйте снова.")
+            return ConversationHandler.END
+
+        # Create fake query for publishing
+        from telegram import CallbackQuery
+        query = CallbackQuery(
+            id="custom",
+            from_user=update.effective_user,
+            chat_instance="custom",
+            data=f"admin_voting_publish_{voting_id}_{days}",
+            bot=context.bot
+        )
+
+        # Publish with custom duration
+        await update.message.reply_text("⏳ Публикую вопрос и отправляю уведомления...")
+
+        async with async_session_maker() as session:
+            voting = await VotingCRUD.get_by_id(session, voting_id)
+            if not voting:
+                await update.message.reply_text("❌ Голосование не найдено.")
+                return ConversationHandler.END
+
+            # Update status to ACTIVE and set proper dates
+            starts_at = datetime.utcnow()
+            ends_at = starts_at + timedelta(days=days)
+
+            await VotingCRUD.update(
+                session,
+                voting,
+                status=VotingStatus.ACTIVE,
+                starts_at=starts_at,
+                ends_at=ends_at
+            )
+
+            # Notify creator
+            try:
+                await context.bot.send_message(
+                    chat_id=voting.creator.telegram_id,
+                    text=f"✅ Ваш вопрос одобрен и опубликован!\n\n"
+                         f"*{voting.title}*\n\n"
+                         f"Голосование будет активно до {format_datetime(ends_at)}.",
+                    parse_mode='Markdown'
+                )
+            except Exception:
+                pass
+
+            # Notify all verified members
+            verified_users = await UserCRUD.get_all_verified(session)
+            options = json.loads(voting.options) if isinstance(voting.options, str) else voting.options
+
+            for user in verified_users:
+                if user.notifications_enabled:
+                    try:
+                        text = f"🗳️ *Новое голосование!*\n\n"
+                        text += f"*{voting.title}*\n\n"
+                        text += f"{voting.description}\n\n"
+                        text += f"Завершается: {format_datetime(ends_at)}\n\n"
+                        text += "*Варианты ответов:*\n"
+                        for i, option in enumerate(options):
+                            text += f"{i+1}. {option}\n"
+
+                        keyboard = []
+                        for i, option in enumerate(options):
+                            keyboard.append([
+                                InlineKeyboardButton(
+                                    f"✓ {option}",
+                                    callback_data=f"vote_cast_{voting.id}_{i}"
+                                )
+                            ])
+
+                        reply_markup = InlineKeyboardMarkup(keyboard)
+                        await context.bot.send_message(
+                            chat_id=user.telegram_id,
+                            text=text,
+                            reply_markup=reply_markup,
+                            parse_mode='Markdown'
+                        )
+                        await asyncio.sleep(0.1)
+                    except Exception as e:
+                        logger.error(f"Failed to notify user {user.telegram_id}: {e}")
+
+        await update.message.reply_text("✅ Вопрос опубликован и отправлен пользователям!")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Пожалуйста, введите корректное число:"
+        )
+        return CUSTOM_VOTING_DURATION
 
 
 async def admin_voting_publish_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1080,3 +1220,17 @@ def register_admin_handlers(application):
         per_chat=True
     )
     application.add_handler(emergency_conv)
+
+    # Custom duration conversation
+    custom_duration_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_voting_custom_duration_callback, pattern="^admin_voting_custom_duration_")],
+        states={
+            CUSTOM_VOTING_DURATION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_voting_custom_duration_receive)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)],
+        allow_reentry=True,
+        per_chat=True
+    )
+    application.add_handler(custom_duration_conv)
