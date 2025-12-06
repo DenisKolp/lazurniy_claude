@@ -37,7 +37,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with async_session_maker() as session:
         user = await UserCRUD.get_by_telegram_id(session, update.effective_user.id)
 
-        if not user or not user.is_admin:
+        if not user or (not user.is_admin and not user.is_manager):
             await update.message.reply_text("❌ Доступ запрещен.")
             return
 
@@ -48,30 +48,39 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         upcoming_events = await EventCRUD.get_upcoming(session, limit=5)
         open_tickets = await TicketCRUD.get_open_tickets(session)
 
-        text = "👨‍💼 *Админ-панель*\n\n"
+        panel_title = "👨‍💼 *Админ-панель*" if user.is_admin else "👨‍💼 *Панель управляющего*"
+        text = f"{panel_title}\n\n"
         text += f"👥 Пользователей:\n"
         text += f"  • Членов ассоциации: {len(verified_users)}\n"
-        text += f"  • На проверке: {len(pending_users)}\n\n"
+        if user.is_admin:
+            text += f"  • На проверке: {len(pending_users)}\n\n"
+        else:
+            text += "\n"
         text += f"🗳️ Активных голосований: {len(active_votings)}\n"
         text += f"📅 Предстоящих событий: {len(upcoming_events)}\n"
         text += f"📝 Открытых обращений: {len(open_tickets)}\n"
 
-        keyboard = [
-            [
+        keyboard = []
+        if user.is_admin:
+            keyboard.append([
                 InlineKeyboardButton(f"👥 Пользователи ({len(pending_users)})", callback_data="admin_users"),
                 InlineKeyboardButton("🗳️ Голосования", callback_data="admin_votings")
-            ],
-            [
+            ])
+            keyboard.append([
                 InlineKeyboardButton(f"📝 Обращение в ИГ ({len(open_tickets)})", callback_data="admin_tickets"),
                 InlineKeyboardButton("📅 События", callback_data="admin_events")
-            ],
-            [
+            ])
+            keyboard.append([
                 InlineKeyboardButton("📢 Оповещение", callback_data="admin_emergency")
-            ],
-            [
+            ])
+            keyboard.append([
                 InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")
-            ]
-        ]
+            ])
+        elif user.is_manager:
+            keyboard.append([
+                InlineKeyboardButton("📅 События", callback_data="admin_events"),
+                InlineKeyboardButton("📢 Оповещение", callback_data="admin_emergency")
+            ])
 
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
@@ -213,23 +222,76 @@ async def admin_user_view_callback(update: Update, context: ContextTypes.DEFAULT
             verified_date = format_datetime(user.verified_at, "%d.%m.%Y %H:%M") if user.verified_at else "Неизвестно"
             text += f"Дата верификации: {verified_date}\n"
 
-            keyboard = [
-                [InlineKeyboardButton("🗑️ Удалить верификацию", callback_data=f"admin_revoke_{user.id}")],
-                [InlineKeyboardButton("◀️ Назад", callback_data="admin_users_verified")]
-            ]
+            # Show manager status
+            if user.is_manager:
+                text += f"Роль: Управляющий\n"
+
+            keyboard = []
+
+            # Manager toggle button
+            if user.is_manager:
+                keyboard.append([InlineKeyboardButton("❌ Отозвать роль управляющего", callback_data=f"admin_unset_manager_{user.id}")])
+            else:
+                keyboard.append([InlineKeyboardButton("✅ Назначить управляющим", callback_data=f"admin_set_manager_{user.id}")])
+
+            keyboard.append([InlineKeyboardButton("🗑️ Удалить верификацию", callback_data=f"admin_revoke_{user.id}")])
+            keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="admin_users_verified")])
+
 
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        # Send documents first if available
+        # First, edit the original message with user info
+        await query.edit_message_text(text, reply_markup=reply_markup)
+
+        # Then send documents separately if available
         if user.verification_documents:
             try:
                 docs = json.loads(user.verification_documents)
-                for doc_id in docs:
-                    await context.bot.send_document(chat_id=query.message.chat_id, document=doc_id)
-            except Exception:
-                pass
+                if docs:
+                    # Store message IDs for potential cleanup
+                    if 'verification_doc_messages' not in context.user_data:
+                        context.user_data['verification_doc_messages'] = []
 
-        await query.edit_message_text(text, reply_markup=reply_markup)
+                    # Send header message
+                    header_msg = await context.bot.send_message(
+                        chat_id=query.message.chat_id,
+                        text="📎 *Прикрепленные документы:*",
+                        parse_mode='Markdown'
+                    )
+                    context.user_data['verification_doc_messages'].append(header_msg.message_id)
+
+                    # Send each document
+                    for idx, doc in enumerate(docs, 1):
+                        try:
+                            # Handle new format (dict with file_id and type) and old format (just string)
+                            if isinstance(doc, dict):
+                                file_id = doc['file_id']
+                                file_type = doc.get('type', 'document')
+                            else:
+                                # Old format compatibility
+                                file_id = doc
+                                file_type = 'document'
+
+                            # Send photo or document based on type
+                            if file_type == 'photo':
+                                msg = await context.bot.send_photo(
+                                    chat_id=query.message.chat_id,
+                                    photo=file_id,
+                                    caption=f"Фото {idx}/{len(docs)}"
+                                )
+                            else:
+                                msg = await context.bot.send_document(
+                                    chat_id=query.message.chat_id,
+                                    document=file_id,
+                                    caption=f"Документ {idx}/{len(docs)}"
+                                )
+                            context.user_data['verification_doc_messages'].append(msg.message_id)
+                        except Exception as e:
+                            logger.error(f"Failed to send file {file_id}: {e}")
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse verification documents: {e}")
+            except Exception as e:
+                logger.error(f"Error sending verification documents: {e}")
 
 
 async def admin_approve_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -240,6 +302,18 @@ async def admin_approve_callback(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer("⏳ Обрабатываю заявку...", show_alert=False)
 
     user_id = int(query.data.split("_")[2])
+
+    # Delete verification document messages if any
+    if 'verification_doc_messages' in context.user_data:
+        for msg_id in context.user_data['verification_doc_messages']:
+            try:
+                await context.bot.delete_message(
+                    chat_id=query.message.chat_id,
+                    message_id=msg_id
+                )
+            except Exception as e:
+                logger.error(f"Failed to delete message {msg_id}: {e}")
+        context.user_data.pop('verification_doc_messages', None)
 
     async with async_session_maker() as session:
         user = await UserCRUD.get_by_id(session, user_id)
@@ -318,6 +392,18 @@ async def admin_reject_reason(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ Ошибка: пользователь не найден.")
         return ConversationHandler.END
 
+    # Delete verification document messages if any
+    if 'verification_doc_messages' in context.user_data:
+        for msg_id in context.user_data['verification_doc_messages']:
+            try:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=msg_id
+                )
+            except Exception as e:
+                logger.error(f"Failed to delete message {msg_id}: {e}")
+        context.user_data.pop('verification_doc_messages', None)
+
     async with async_session_maker() as session:
         user = await UserCRUD.get_by_id(session, user_id)
         if not user:
@@ -349,6 +435,83 @@ async def admin_reject_reason(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Clear user data
     context.user_data.pop('reject_user_id', None)
     return ConversationHandler.END
+
+
+async def admin_set_manager_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set user as manager"""
+    query = update.callback_query
+    await safe_answer_query(query)
+
+    user_id = int(query.data.split("_")[3])
+
+    async with async_session_maker() as session:
+        admin_user = await UserCRUD.get_by_telegram_id(session, query.from_user.id)
+        if not admin_user or not admin_user.is_admin:
+            await query.answer("❌ Доступ запрещен.", show_alert=True)
+            return
+
+        user = await UserCRUD.get_by_id(session, user_id)
+        if not user:
+            await query.answer("❌ Пользователь не найден.", show_alert=True)
+            return
+
+        # Update user to manager
+        await UserCRUD.update(session, user, is_manager=True)
+
+    # Notify user
+    try:
+        await context.bot.send_message(
+            chat_id=user.telegram_id,
+            text="🎉 Вам назначена роль управляющего!\n\n"
+                 "Теперь вам доступны дополнительные функции:\n"
+                 "• Создание событий\n"
+                 "• Отправка оповещений\n\n"
+                 "Используйте команду /admin для доступа к панели управляющего."
+        )
+    except Exception:
+        pass
+
+    await query.answer("✅ Пользователь назначен управляющим.", show_alert=True)
+
+    # Refresh the user view
+    await admin_user_view_callback(update, context)
+
+
+async def admin_unset_manager_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove manager role from user"""
+    query = update.callback_query
+    await safe_answer_query(query)
+
+    user_id = int(query.data.split("_")[3])
+
+    async with async_session_maker() as session:
+        admin_user = await UserCRUD.get_by_telegram_id(session, query.from_user.id)
+        if not admin_user or not admin_user.is_admin:
+            await query.answer("❌ Доступ запрещен.", show_alert=True)
+            return
+
+        user = await UserCRUD.get_by_id(session, user_id)
+        if not user:
+            await query.answer("❌ Пользователь не найден.", show_alert=True)
+            return
+
+        # Remove manager role
+        await UserCRUD.update(session, user, is_manager=False)
+
+    # Notify user
+    try:
+        await context.bot.send_message(
+            chat_id=user.telegram_id,
+            text="ℹ️ Роль управляющего отозвана администратором.\n\n"
+                 "Доступ к панели управляющего был удалён."
+        )
+    except Exception:
+        pass
+
+    await query.answer("✅ Роль управляющего отозвана.", show_alert=True)
+
+    # Refresh the user view
+    await admin_user_view_callback(update, context)
 
 
 async def admin_revoke_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -468,34 +631,89 @@ async def admin_ticket_view_callback(update: Update, context: ContextTypes.DEFAU
                 )
                 return
 
-            user_name = get_user_display_name(ticket.user)
-            created = format_datetime(ticket.created_at, "%d.%m.%Y %H:%M")
+            # Check if user is loaded
+            if not ticket.user:
+                logger.error(f"User not loaded for ticket #{ticket_id}")
+                await query.edit_message_text(
+                    "❌ Произошла ошибка при загрузке обращения.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("◀️ Назад", callback_data="admin_tickets")
+                    ]])
+                )
+                return
 
-            text = f"📝 *Обращение #{ticket.id}*\n\n"
-            text += f"От: {user_name}\n"
-            text += f"Дата: {created}\n\n"
-            text += f"*{ticket.title}*\n\n"
-            text += f"{ticket.description}\n"
+            # Extract all data we need while session is active
+            user_first_name = ticket.user.first_name
+            user_last_name = ticket.user.last_name
+            user_username = ticket.user.username
+            user_telegram_id = ticket.user.telegram_id
+            ticket_title = ticket.title
+            ticket_description = ticket.description
+            ticket_created_at = ticket.created_at
+            ticket_attachments = ticket.attachments
+            ticket_status = ticket.status
+            ticket_response = ticket.response
+            ticket_responded_at = ticket.responded_at
 
-            keyboard = [
-                [InlineKeyboardButton("💬 Ответить", callback_data=f"admin_respond_{ticket.id}")],
-                [InlineKeyboardButton("✅ Закрыть", callback_data=f"admin_close_{ticket.id}")],
-                [InlineKeyboardButton("◀️ Назад", callback_data="admin_tickets")]
-            ]
+        # Now we can safely use the data outside the session context
+        # Build user display name
+        if user_first_name and user_last_name:
+            user_name = f"{user_first_name} {user_last_name}"
+        elif user_first_name:
+            user_name = user_first_name
+        elif user_username:
+            user_name = f"@{user_username}"
+        else:
+            user_name = f"User {user_telegram_id}"
 
-            reply_markup = InlineKeyboardMarkup(keyboard)
+        created = format_datetime(ticket_created_at, "%d.%m.%Y %H:%M")
 
-            # Send attachments if available
-            if ticket.attachments:
-                try:
-                    attachments = json.loads(ticket.attachments)
-                    for file_id in attachments:
-                        await context.bot.send_document(chat_id=query.message.chat_id, document=file_id)
-                except Exception as e:
-                    logger.error(f"Failed to send attachments: {e}")
+        # Status emoji
+        status_emoji = {
+            TicketStatus.NEW: "🆕",
+            TicketStatus.IN_PROGRESS: "⏳",
+            TicketStatus.ANSWERED: "✅",
+            TicketStatus.CLOSED: "🔒"
+        }
 
-            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-            logger.info(f"Successfully displayed ticket #{ticket_id}")
+        text = f"📝 *Обращение #{ticket_id}*\n\n"
+        text += f"Статус: {status_emoji.get(ticket_status, '')} {ticket_status.value}\n"
+        text += f"От: {user_name}\n"
+        text += f"Дата: {created}\n\n"
+        text += f"*{ticket_title}*\n\n"
+        text += f"{ticket_description}\n"
+
+        # Add response if exists
+        if ticket_response:
+            responded = format_datetime(ticket_responded_at, "%d.%m.%Y %H:%M")
+            text += f"\n\n💬 *Ответ администратора* ({responded}):\n"
+            text += f"{ticket_response}\n"
+
+        keyboard = []
+        # Only show "Ответить" button if not already answered or closed
+        if ticket_status not in [TicketStatus.ANSWERED, TicketStatus.CLOSED]:
+            keyboard.append([InlineKeyboardButton("💬 Ответить", callback_data=f"admin_respond_{ticket_id}")])
+        elif ticket_status == TicketStatus.ANSWERED:
+            keyboard.append([InlineKeyboardButton("💬 Изменить ответ", callback_data=f"admin_respond_{ticket_id}")])
+
+        if ticket_status != TicketStatus.CLOSED:
+            keyboard.append([InlineKeyboardButton("✅ Закрыть", callback_data=f"admin_close_{ticket_id}")])
+
+        keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="admin_tickets")])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        # Send attachments if available
+        if ticket_attachments:
+            try:
+                attachments = json.loads(ticket_attachments)
+                for file_id in attachments:
+                    await context.bot.send_document(chat_id=query.message.chat_id, document=file_id)
+            except Exception as e:
+                logger.error(f"Failed to send attachments: {e}")
+
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+        logger.info(f"Successfully displayed ticket #{ticket_id}")
     except Exception as e:
         logger.error(f"Error in admin_ticket_view_callback: {e}", exc_info=True)
         try:
@@ -510,7 +728,7 @@ async def admin_ticket_view_callback(update: Update, context: ContextTypes.DEFAU
 
 
 async def admin_respond_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Respond to ticket"""
+    """Start responding to ticket"""
     query = update.callback_query
     await safe_answer_query(query)
 
@@ -518,14 +736,99 @@ async def admin_respond_callback(update: Update, context: ContextTypes.DEFAULT_T
     parts = query.data.split("_")
     ticket_id = int(parts[-1])
 
+    # Check admin permissions
+    async with async_session_maker() as session:
+        admin_user = await UserCRUD.get_by_telegram_id(session, query.from_user.id)
+        if not admin_user or (not admin_user.is_admin and not admin_user.is_manager):
+            await query.answer("❌ Доступ запрещен.", show_alert=True)
+            return ConversationHandler.END
+
+        # Check if ticket exists
+        ticket = await TicketCRUD.get_by_id(session, ticket_id)
+        if not ticket:
+            await query.answer("❌ Обращение не найдено.", show_alert=True)
+            return ConversationHandler.END
+
+    # Save ticket_id in context
+    context.user_data['responding_ticket_id'] = ticket_id
+
     await query.edit_message_text(
         f"💬 Ответ на обращение #{ticket_id}\n\n"
-        "Эта функция в разработке.\n\n"
-        "Используйте /admin для возврата в админ-панель.",
+        "Введите текст ответа для пользователя:",
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("◀️ Назад", callback_data=f"admin_ticket_{ticket_id}")
+            InlineKeyboardButton("❌ Отмена", callback_data=f"admin_ticket_{ticket_id}")
         ]])
     )
+
+    return TICKET_RESPONSE
+
+
+async def admin_ticket_response_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Process admin's response to ticket"""
+    ticket_id = context.user_data.get('responding_ticket_id')
+    if not ticket_id:
+        await update.message.reply_text("❌ Произошла ошибка. Попробуйте снова.")
+        return ConversationHandler.END
+
+    response_text = update.message.text
+
+    async with async_session_maker() as session:
+        # Get admin user
+        admin_user = await UserCRUD.get_by_telegram_id(session, update.effective_user.id)
+        if not admin_user or (not admin_user.is_admin and not admin_user.is_manager):
+            await update.message.reply_text("❌ Доступ запрещен.")
+            return ConversationHandler.END
+
+        # Get ticket with user loaded
+        ticket = await TicketCRUD.get_by_id(session, ticket_id)
+        if not ticket:
+            await update.message.reply_text("❌ Обращение не найдено.")
+            return ConversationHandler.END
+
+        # Extract data while in session
+        user_telegram_id = ticket.user.telegram_id
+        ticket_title = ticket.title
+        ticket_description = ticket.description
+
+        # Update ticket with response
+        from datetime import datetime
+        await TicketCRUD.update(
+            session,
+            ticket,
+            response=response_text,
+            responded_at=datetime.utcnow(),
+            responded_by=admin_user.id,
+            status=TicketStatus.ANSWERED
+        )
+
+    # Notify the user who created the ticket
+    try:
+        await context.bot.send_message(
+            chat_id=user_telegram_id,
+            text=(
+                f"💬 *Ответ на ваше обращение*\n\n"
+                f"*Обращение:* {ticket_title}\n\n"
+                f"*Ответ администратора:*\n{response_text}\n\n"
+                f"Вы можете посмотреть обращение в разделе \"Мои обращения\"."
+            ),
+            parse_mode='Markdown'
+        )
+    except Exception:
+        pass
+
+    # Show success message to admin
+    await update.message.reply_text(
+        f"✅ Ответ на обращение #{ticket_id} отправлен пользователю.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("📋 К списку обращений", callback_data="admin_tickets"),
+            InlineKeyboardButton("👁️ Просмотр обращения", callback_data=f"admin_ticket_{ticket_id}")
+        ]])
+    )
+
+    # Clear context
+    context.user_data.pop('responding_ticket_id', None)
+
+    return ConversationHandler.END
 
 
 async def admin_close_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -566,6 +869,12 @@ async def admin_emergency_start(update: Update, context: ContextTypes.DEFAULT_TY
     """Start emergency broadcast"""
     query = update.callback_query
     await safe_answer_query(query)
+
+    async with async_session_maker() as session:
+        user = await UserCRUD.get_by_telegram_id(session, query.from_user.id)
+        if not user or (not user.is_admin and not user.is_manager):
+            await query.answer("❌ Доступ запрещен.", show_alert=True)
+            return ConversationHandler.END
 
     await query.edit_message_text(
         "📢 *Оповещение*\n\n"
@@ -1118,7 +1427,7 @@ async def admin_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     async with async_session_maker() as session:
         user = await UserCRUD.get_by_telegram_id(session, update.effective_user.id)
 
-        if not user or not user.is_admin:
+        if not user or (not user.is_admin and not user.is_manager):
             await query.edit_message_text("❌ Доступ запрещен.")
             return
 
@@ -1129,28 +1438,39 @@ async def admin_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         upcoming_events = await EventCRUD.get_upcoming(session, limit=5)
         open_tickets = await TicketCRUD.get_open_tickets(session)
 
-        text = "👨‍💼 *Админ-панель*\n\n"
+        panel_title = "👨‍💼 *Админ-панель*" if user.is_admin else "👨‍💼 *Панель управляющего*"
+        text = f"{panel_title}\n\n"
         text += f"👥 Пользователей:\n"
         text += f"  • Членов ассоциации: {len(verified_users)}\n"
-        text += f"  • На проверке: {len(pending_users)}\n\n"
+        if user.is_admin:
+            text += f"  • На проверке: {len(pending_users)}\n\n"
+        else:
+            text += "\n"
         text += f"🗳️ Активных голосований: {len(active_votings)}\n"
         text += f"📅 Предстоящих событий: {len(upcoming_events)}\n"
         text += f"📝 Открытых обращений: {len(open_tickets)}\n"
 
-        keyboard = [
-            [
+        keyboard = []
+        if user.is_admin:
+            keyboard.append([
                 InlineKeyboardButton(f"👥 Пользователи ({len(pending_users)})", callback_data="admin_users"),
                 InlineKeyboardButton("🗳️ Голосования", callback_data="admin_votings")
-            ],
-            [
-                InlineKeyboardButton("📅 События", callback_data="admin_events"),
-                InlineKeyboardButton(f"📝 Обращение в ИГ ({len(open_tickets)})", callback_data="admin_tickets")
-            ],
-            [
-                InlineKeyboardButton("📊 Статистика", callback_data="admin_stats"),
+            ])
+            keyboard.append([
+                InlineKeyboardButton(f"📝 Обращение в ИГ ({len(open_tickets)})", callback_data="admin_tickets"),
+                InlineKeyboardButton("📅 События", callback_data="admin_events")
+            ])
+            keyboard.append([
                 InlineKeyboardButton("📢 Оповещение", callback_data="admin_emergency")
-            ]
-        ]
+            ])
+            keyboard.append([
+                InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")
+            ])
+        elif user.is_manager:
+            keyboard.append([
+                InlineKeyboardButton("📅 События", callback_data="admin_events"),
+                InlineKeyboardButton("📢 Оповещение", callback_data="admin_emergency")
+            ])
 
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(
@@ -1175,6 +1495,8 @@ def register_admin_handlers(application):
     application.add_handler(CallbackQueryHandler(admin_users_verified_callback, pattern="^admin_users_verified$"))
     application.add_handler(CallbackQueryHandler(admin_user_view_callback, pattern="^admin_user_"))
     application.add_handler(CallbackQueryHandler(admin_approve_callback, pattern="^admin_approve_"))
+    application.add_handler(CallbackQueryHandler(admin_set_manager_callback, pattern="^admin_set_manager_"))
+    application.add_handler(CallbackQueryHandler(admin_unset_manager_callback, pattern="^admin_unset_manager_"))
     application.add_handler(CallbackQueryHandler(admin_revoke_callback, pattern="^admin_revoke_"))
     application.add_handler(CallbackQueryHandler(admin_votings_callback, pattern="^admin_votings$"))
     application.add_handler(CallbackQueryHandler(admin_votings_draft_callback, pattern="^admin_votings_draft$"))
@@ -1188,7 +1510,6 @@ def register_admin_handlers(application):
     application.add_handler(CallbackQueryHandler(admin_events_callback, pattern="^admin_events$"))
     application.add_handler(CallbackQueryHandler(admin_tickets_callback, pattern="^admin_tickets$"))
     application.add_handler(CallbackQueryHandler(admin_ticket_view_callback, pattern="^admin_ticket_"))
-    application.add_handler(CallbackQueryHandler(admin_respond_callback, pattern="^admin_respond_"))
     application.add_handler(CallbackQueryHandler(admin_close_callback, pattern="^admin_close_"))
     application.add_handler(CallbackQueryHandler(admin_stats_callback, pattern="^admin_stats$"))
     application.add_handler(CallbackQueryHandler(admin_back_callback, pattern="^admin_back$"))
@@ -1234,3 +1555,17 @@ def register_admin_handlers(application):
         per_chat=True
     )
     application.add_handler(custom_duration_conv)
+
+    # Ticket response conversation
+    ticket_response_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_respond_callback, pattern="^admin_respond_")],
+        states={
+            TICKET_RESPONSE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_ticket_response_received)
+            ],
+        },
+        fallbacks=[CallbackQueryHandler(admin_ticket_view_callback, pattern="^admin_ticket_")],
+        allow_reentry=True,
+        per_chat=True
+    )
+    application.add_handler(ticket_response_conv)

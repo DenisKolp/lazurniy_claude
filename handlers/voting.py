@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 # Conversation states
 VOTING_TITLE, VOTING_DESCRIPTION, VOTING_OPTIONS, VOTING_DURATION = range(4)
-PROPOSE_TITLE, PROPOSE_DESCRIPTION, PROPOSE_OPTIONS = range(4, 7)
+PROPOSE_DESCRIPTION, PROPOSE_OPTIONS = range(4, 6)
 
 
 async def voting_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -146,8 +146,8 @@ async def voting_list_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 text += f"{i+1}. {option} - {votes} ({percent:.1f}%)\n"
 
             keyboard = []
-            # Allow voting/revoting if voting is active
-            if voting.status == VotingStatus.ACTIVE:
+            # Allow voting only if user hasn't voted yet and voting is active
+            if existing_vote is None and voting.status == VotingStatus.ACTIVE:
                 for i, option in enumerate(options):
                     keyboard.append([
                         InlineKeyboardButton(
@@ -155,6 +155,14 @@ async def voting_list_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                             callback_data=f"vote_cast_{voting.id}_{i}"
                         )
                     ])
+            # Add revote button if user already voted and voting is still active
+            elif existing_vote is not None and voting.status == VotingStatus.ACTIVE:
+                keyboard.append([
+                    InlineKeyboardButton(
+                        "🔄 Переголосовать",
+                        callback_data=f"vote_revote_{voting.id}"
+                    )
+                ])
 
             # Add manual end voting button for admins
             if user.is_admin and voting.status == VotingStatus.ACTIVE:
@@ -217,6 +225,14 @@ async def voting_view_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                         callback_data=f"vote_cast_{voting_id}_{i}"
                     )
                 ])
+        # Add revote button if user already voted and voting is still active
+        elif existing_vote is not None and voting.status == VotingStatus.ACTIVE:
+            keyboard.append([
+                InlineKeyboardButton(
+                    "🔄 Переголосовать",
+                    callback_data=f"vote_revote_{voting_id}"
+                )
+            ])
 
         # Add manual end voting button for admins
         if user.is_admin and voting.status == VotingStatus.ACTIVE:
@@ -245,19 +261,19 @@ async def vote_cast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await query.answer("❌ Голосование не активно.", show_alert=True)
             return
 
-        # Check if already voted - if yes, update the vote
+        # Check if already voted - if yes, show error
         existing_vote = await VoteCRUD.get_user_vote(session, user.id, voting_id)
         if existing_vote:
-            # Update existing vote
-            await VoteCRUD.update(session, existing_vote, option_index=option_index)
-        else:
-            # Create new vote
-            await VoteCRUD.create(
-                session,
-                user_id=user.id,
-                voting_id=voting_id,
-                option_index=option_index
-            )
+            await query.answer("❌ Вы уже проголосовали в этом голосовании.", show_alert=True)
+            return
+
+        # Create new vote
+        await VoteCRUD.create(
+            session,
+            user_id=user.id,
+            voting_id=voting_id,
+            option_index=option_index
+        )
 
         # Update voting
         total_votes = await VoteCRUD.count_votes(session, voting_id)
@@ -281,16 +297,139 @@ async def vote_cast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             percent = (votes / total_votes * 100) if total_votes > 0 else 0
             text += f"{i+1}. {option} - {votes} ({percent:.1f}%)\n"
 
-        # Show voting buttons (allow revoting) and end button for admins
+        # Show revote button and admin buttons
         keyboard = []
-        if voting.status == VotingStatus.ACTIVE:
-            for i, option in enumerate(options):
-                keyboard.append([
-                    InlineKeyboardButton(
-                        f"✓ {option}",
-                        callback_data=f"vote_cast_{voting_id}_{i}"
-                    )
-                ])
+        # Add revote button for the user who just voted
+        keyboard.append([
+            InlineKeyboardButton(
+                "🔄 Переголосовать",
+                callback_data=f"vote_revote_{voting_id}"
+            )
+        ])
+
+        # Add end button for admins
+        if user.is_admin and voting.status == VotingStatus.ACTIVE:
+            keyboard.append([InlineKeyboardButton("⏹️ Завершить голосование", callback_data=f"voting_end_{voting_id}")])
+
+        reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+
+
+async def vote_revote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show voting options again for revote"""
+    query = update.callback_query
+    await query.answer()
+
+    voting_id = int(query.data.split("_")[2])
+
+    async with async_session_maker() as session:
+        voting = await VotingCRUD.get_by_id(session, voting_id)
+        if not voting:
+            await query.answer("❌ Голосование не найдено.", show_alert=True)
+            return
+
+        if voting.status != VotingStatus.ACTIVE:
+            await query.answer("❌ Голосование не активно.", show_alert=True)
+            return
+
+        user = await UserCRUD.get_by_telegram_id(session, query.from_user.id)
+        existing_vote = await VoteCRUD.get_user_vote(session, user.id, voting_id)
+
+        if existing_vote is None:
+            await query.answer("❌ Вы еще не голосовали в этом голосовании.", show_alert=True)
+            return
+
+        # Get current results
+        results = await VoteCRUD.get_voting_results(session, voting_id)
+        total_votes = await VoteCRUD.count_votes(session, voting_id)
+
+        options = json.loads(voting.options) if isinstance(voting.options, str) else voting.options
+
+        text = f"📊 *{voting.title}*\n\n"
+        text += f"{voting.description}\n\n"
+        text += f"Завершается: {format_datetime(voting.ends_at)}\n"
+        text += f"Всего голосов: {total_votes}\n\n"
+        text += f"✅ Текущий выбор: {options[existing_vote.option_index]}\n\n"
+        text += "*Выберите новый вариант:*\n"
+        for i, option in enumerate(options):
+            votes = results.get(i, 0)
+            percent = (votes / total_votes * 100) if total_votes > 0 else 0
+            text += f"{i+1}. {option} - {votes} ({percent:.1f}%)\n"
+
+        # Show all voting options with revote prefix
+        keyboard = []
+        for i, option in enumerate(options):
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"✓ {option}",
+                    callback_data=f"vote_recast_{voting_id}_{i}"
+                )
+            ])
+
+        keyboard.append([InlineKeyboardButton("◀️ Отмена", callback_data=f"voting_view_{voting_id}")])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+
+
+async def vote_recast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Update an existing vote (revote)"""
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split("_")
+    voting_id = int(parts[2])
+    option_index = int(parts[3])
+
+    async with async_session_maker() as session:
+        user = await UserCRUD.get_by_telegram_id(session, query.from_user.id)
+        voting = await VotingCRUD.get_by_id(session, voting_id)
+
+        if not voting or voting.status != VotingStatus.ACTIVE:
+            await query.answer("❌ Голосование не активно.", show_alert=True)
+            return
+
+        # Get existing vote
+        existing_vote = await VoteCRUD.get_user_vote(session, user.id, voting_id)
+        if not existing_vote:
+            await query.answer("❌ Вы еще не голосовали в этом голосовании.", show_alert=True)
+            return
+
+        old_option_index = existing_vote.option_index
+
+        # Update the vote
+        await VoteCRUD.update(
+            session,
+            existing_vote,
+            option_index=option_index
+        )
+
+        options = json.loads(voting.options) if isinstance(voting.options, str) else voting.options
+        await query.answer(f"✅ Голос изменен: {options[option_index]}", show_alert=True)
+
+        # Update the message with new results
+        results = await VoteCRUD.get_voting_results(session, voting_id)
+        total_votes = await VoteCRUD.count_votes(session, voting_id)
+
+        text = f"📊 *{voting.title}*\n\n"
+        text += f"{voting.description}\n\n"
+        text += f"Завершается: {format_datetime(voting.ends_at)}\n"
+        text += f"Всего голосов: {total_votes}\n\n"
+        text += f"✅ Вы проголосовали за вариант: {options[option_index]}\n\n"
+        text += "*Варианты ответов:*\n"
+        for i, option in enumerate(options):
+            votes = results.get(i, 0)
+            percent = (votes / total_votes * 100) if total_votes > 0 else 0
+            text += f"{i+1}. {option} - {votes} ({percent:.1f}%)\n"
+
+        # Show revote button and admin buttons
+        keyboard = []
+        keyboard.append([
+            InlineKeyboardButton(
+                "🔄 Переголосовать",
+                callback_data=f"vote_revote_{voting_id}"
+            )
+        ])
 
         if user.is_admin and voting.status == VotingStatus.ACTIVE:
             keyboard.append([InlineKeyboardButton("⏹️ Завершить голосование", callback_data=f"voting_end_{voting_id}")])
@@ -300,11 +439,9 @@ async def vote_cast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def voting_end_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manually end an active voting (admin only)"""
+    """Manually end all active votings (admin only)"""
     query = update.callback_query
     await query.answer()
-
-    voting_id = int(query.data.split("_")[2])
 
     async with async_session_maker() as session:
         user = await UserCRUD.get_by_telegram_id(session, query.from_user.id)
@@ -314,59 +451,48 @@ async def voting_end_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.answer("❌ Доступ запрещен.", show_alert=True)
             return
 
-        voting = await VotingCRUD.get_by_id(session, voting_id)
-        if not voting:
-            await query.answer("❌ Голосование не найдено.", show_alert=True)
+        # Get all active votings instead of just one
+        active_votings = await VotingCRUD.get_active(session)
+
+        if not active_votings:
+            await query.answer("❌ Нет активных голосований.", show_alert=True)
             return
 
-        if voting.status != VotingStatus.ACTIVE:
-            await query.answer("❌ Голосование уже завершено.", show_alert=True)
-            return
+        # Process each active voting
+        all_voting_results = []
+        for voting in active_votings:
+            # Get results
+            results = await VoteCRUD.get_voting_results(session, voting.id)
+            total_votes = await VoteCRUD.count_votes(session, voting.id)
 
-        # Get results
-        results = await VoteCRUD.get_voting_results(session, voting_id)
-        total_votes = await VoteCRUD.count_votes(session, voting_id)
+            # Update voting status
+            await VotingCRUD.update(
+                session,
+                voting,
+                status=VotingStatus.COMPLETED,
+                results=results,
+                total_votes=total_votes
+            )
 
-        # Update voting status
-        await VotingCRUD.update(
-            session,
-            voting,
-            status=VotingStatus.COMPLETED,
-            results=results,
-            total_votes=total_votes
-        )
+            options = json.loads(voting.options) if isinstance(voting.options, str) else voting.options
+            all_voting_results.append({
+                'voting': voting,
+                'options': options,
+                'results': results,
+                'total_votes': total_votes
+            })
 
-        options = json.loads(voting.options) if isinstance(voting.options, str) else voting.options
-
-        # Export to Google Sheets
+        # Export all results to a single Google Sheets file
         sheets_url = None
         try:
-            sheets_url = await sheets_service.export_voting_results(
-                voting_id=voting.id,
-                voting_title=voting.title,
-                voting_description=voting.description or "",
-                options=options,
-                results=results,
-                total_votes=total_votes,
-                created_at=voting.created_at,
-                ends_at=voting.ends_at
-            )
+            logger.info(f"Exporting {len(all_voting_results)} voting results to Google Sheets...")
+            sheets_url = await sheets_service.export_all_voting_results(all_voting_results)
+            if sheets_url:
+                logger.info(f"Successfully exported voting results to: {sheets_url}")
+            else:
+                logger.warning("Export returned None - no URL was generated")
         except Exception as e:
-            logger.error(f"Failed to export voting results: {e}")
-
-        # Prepare results message
-        message = f"📊 *Голосование завершено*\n\n"
-        message += f"*{voting.title}*\n\n"
-        message += f"Всего голосов: {total_votes}\n\n"
-        message += "*Результаты:*\n"
-
-        for i, option in enumerate(options):
-            votes = results.get(i, 0)
-            percent = (votes / total_votes * 100) if total_votes > 0 else 0
-            message += f"{i+1}. {option}: {votes} ({percent:.1f}%)\n"
-
-        if sheets_url:
-            message += f"\n📄 [Просмотреть детальные результаты]({sheets_url})"
+            logger.error(f"Failed to export voting results: {e}", exc_info=True)
 
         # Send results to all verified users
         verified_users = await UserCRUD.get_all_verified(session)
@@ -374,6 +500,30 @@ async def voting_end_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         for u in verified_users:
             if u.notifications_enabled:
                 try:
+                    # Prepare message with all voting results
+                    message = f"📊 *Голосование завершено*\n\n"
+                    message += f"Завершено вопросов: {len(all_voting_results)}\n\n"
+
+                    for idx, result_data in enumerate(all_voting_results, 1):
+                        voting = result_data['voting']
+                        options = result_data['options']
+                        results = result_data['results']
+                        total_votes = result_data['total_votes']
+
+                        message += f"*Вопрос {idx}: {voting.title}*\n"
+                        message += f"Всего голосов: {total_votes}\n"
+                        message += "*Результаты:*\n"
+
+                        for i, option in enumerate(options):
+                            votes = results.get(i, 0)
+                            percent = (votes / total_votes * 100) if total_votes > 0 else 0
+                            message += f"  {i+1}. {option}: {votes} ({percent:.1f}%)\n"
+                        message += "\n"
+
+                    # Add detailed results link only for admins
+                    if u.is_admin and sheets_url:
+                        message += f"\n📄 [Просмотреть детальные результаты]({sheets_url})"
+
                     await context.bot.send_message(
                         chat_id=u.telegram_id,
                         text=message,
@@ -384,10 +534,44 @@ async def voting_end_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 except Exception as e:
                     logger.error(f"Failed to send results to {u.telegram_id}: {e}")
 
-        await query.answer(f"✅ Голосование завершено. Результаты отправлены {sent_count} пользователям.", show_alert=True)
+        await query.answer(f"✅ Голосование завершено. {len(all_voting_results)} вопросов завершено. Результаты отправлены {sent_count} пользователям.", show_alert=True)
 
-        # Update message to show completed status
-        await query.edit_message_text(message, parse_mode='Markdown')
+        # Update admin's message to show completed status with detailed results link
+        admin_message = f"📊 *Голосование завершено*\n\n"
+        admin_message += f"Завершено вопросов: {len(all_voting_results)}\n\n"
+
+        for idx, result_data in enumerate(all_voting_results, 1):
+            voting = result_data['voting']
+            options = result_data['options']
+            results = result_data['results']
+            total_votes = result_data['total_votes']
+
+            admin_message += f"*Вопрос {idx}: {voting.title}*\n"
+            admin_message += f"Всего голосов: {total_votes}\n"
+            admin_message += "*Результаты:*\n"
+
+            for i, option in enumerate(options):
+                votes = results.get(i, 0)
+                percent = (votes / total_votes * 100) if total_votes > 0 else 0
+                admin_message += f"  {i+1}. {option}: {votes} ({percent:.1f}%)\n"
+            admin_message += "\n"
+
+        if sheets_url:
+            admin_message += f"\n📄 [Просмотреть детальные результаты]({sheets_url})"
+
+        try:
+            await query.edit_message_text(admin_message, parse_mode='Markdown')
+        except Exception as e:
+            logger.error(f"Failed to update admin message: {e}", exc_info=True)
+            # Try without markdown links if it fails
+            try:
+                if sheets_url:
+                    admin_message_plain = admin_message.replace(f"[Просмотреть детальные результаты]({sheets_url})", f"Ссылка: {sheets_url}")
+                    await query.edit_message_text(admin_message_plain, parse_mode='Markdown')
+                else:
+                    await query.edit_message_text(admin_message, parse_mode='Markdown')
+            except Exception as e2:
+                logger.error(f"Failed to update admin message even without links: {e2}", exc_info=True)
 
 
 async def voting_create_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -541,26 +725,8 @@ async def voting_propose_callback(update: Update, context: ContextTypes.DEFAULT_
 
     await query.edit_message_text(
         "➕ *Предложить вопрос для голосования*\n\n"
-        "Шаг 1/3: Введите название вопроса:",
+        "Шаг 1/2: Введите описание вопроса:",
         parse_mode='Markdown'
-    )
-    return PROPOSE_TITLE
-
-
-async def propose_receive_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive proposed question title"""
-    title = update.message.text.strip()
-
-    if not validate_title(title):
-        await update.message.reply_text(
-            "❌ Название должно быть от 5 до 500 символов. Попробуйте еще раз:"
-        )
-        return PROPOSE_TITLE
-
-    context.user_data['propose_title'] = title
-    await update.message.reply_text(
-        "✅ Название сохранено!\n\n"
-        "Шаг 2/3: Введите описание вопроса:"
     )
     return PROPOSE_DESCRIPTION
 
@@ -578,7 +744,7 @@ async def propose_receive_description(update: Update, context: ContextTypes.DEFA
     context.user_data['propose_description'] = description
     await update.message.reply_text(
         "✅ Описание сохранено!\n\n"
-        "Шаг 3/3: Введите варианты ответов (каждый с новой строки, минимум 2):\n\n"
+        "Шаг 2/2: Введите варианты ответов (каждый с новой строки, минимум 2):\n\n"
         "Пример:\n"
         "За\n"
         "Против\n"
@@ -600,11 +766,15 @@ async def propose_receive_options(update: Update, context: ContextTypes.DEFAULT_
     async with async_session_maker() as session:
         user = await UserCRUD.get_by_telegram_id(session, update.effective_user.id)
 
+        # Use description as title (first 100 chars) since we removed title step
+        description = context.user_data['propose_description']
+        title = description[:100] + ('...' if len(description) > 100 else '')
+
         # Create draft voting (not active yet)
         voting = await VotingCRUD.create(
             session,
-            title=context.user_data['propose_title'],
-            description=context.user_data['propose_description'],
+            title=title,
+            description=description,
             options=json.dumps(options),
             creator_id=user.id,
             status=VotingStatus.DRAFT,
@@ -615,7 +785,7 @@ async def propose_receive_options(update: Update, context: ContextTypes.DEFAULT_
 
     await update.message.reply_text(
         f"✅ Вопрос предложен!\n\n"
-        f"Название: {voting.title}\n\n"
+        f"{voting.description[:200]}{'...' if len(voting.description) > 200 else ''}\n\n"
         "Ваш вопрос отправлен на модерацию администраторам.\n"
         "После одобрения он будет опубликован для всех участников."
     )
@@ -763,6 +933,8 @@ def register_voting_handlers(application):
     application.add_handler(CallbackQueryHandler(voting_list_callback, pattern="^voting_list$"))
     application.add_handler(CallbackQueryHandler(voting_view_callback, pattern="^voting_view_"))
     application.add_handler(CallbackQueryHandler(vote_cast_callback, pattern="^vote_cast_"))
+    application.add_handler(CallbackQueryHandler(vote_revote_callback, pattern="^vote_revote_"))
+    application.add_handler(CallbackQueryHandler(vote_recast_callback, pattern="^vote_recast_"))
     application.add_handler(CallbackQueryHandler(voting_end_callback, pattern="^voting_end_"))
     application.add_handler(CallbackQueryHandler(voting_create_start, pattern="^voting_create$"))
     # Removed: voting_my and voting_history - not needed by users
@@ -797,9 +969,6 @@ def register_voting_handlers(application):
     propose_voting_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(voting_propose_callback, pattern="^voting_propose$")],
         states={
-            PROPOSE_TITLE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, propose_receive_title)
-            ],
             PROPOSE_DESCRIPTION: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, propose_receive_description)
             ],

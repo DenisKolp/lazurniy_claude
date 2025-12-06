@@ -63,6 +63,7 @@ class User(Base):
     # Profile
     address: Mapped[Optional[str]] = mapped_column(String(500))
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_manager: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # Notifications settings
     notifications_enabled: Mapped[bool] = mapped_column(Boolean, default=True)

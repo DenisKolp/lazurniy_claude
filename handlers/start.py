@@ -331,7 +331,11 @@ async def receive_documents(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo = update.message.photo[-1]
         if 'documents' not in context.user_data:
             context.user_data['documents'] = []
-        context.user_data['documents'].append(photo.file_id)
+        # Store file_id with type information
+        context.user_data['documents'].append({
+            'file_id': photo.file_id,
+            'type': 'photo'
+        })
 
         keyboard = [
             [KeyboardButton("✅ Готово, перейти к следующему шагу")],
@@ -351,10 +355,13 @@ async def receive_documents(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.message.document:
         file = update.message.document
         if validate_document(file.file_name):
-            # Store file_id for later retrieval
+            # Store file_id with type information
             if 'documents' not in context.user_data:
                 context.user_data['documents'] = []
-            context.user_data['documents'].append(file.file_id)
+            context.user_data['documents'].append({
+                'file_id': file.file_id,
+                'type': 'document'
+            })
 
             keyboard = [
                 [KeyboardButton("✅ Готово, перейти к следующему шагу")],

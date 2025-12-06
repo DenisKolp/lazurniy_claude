@@ -49,7 +49,7 @@ async def events_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("📋 Все события", callback_data="events_list")],
         ]
 
-        if user.is_admin:
+        if user.is_admin or user.is_manager:
             keyboard.append([InlineKeyboardButton("➕ Создать событие", callback_data="event_create")])
 
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -109,7 +109,7 @@ async def event_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         text += f"🕐 Дата и время: {event_date}\n"
 
         keyboard = []
-        if user.is_admin:
+        if user.is_admin or user.is_manager:
             keyboard.append([
                 InlineKeyboardButton("✏️ Редактировать", callback_data=f"event_edit_{event.id}"),
                 InlineKeyboardButton("🗑️ Удалить", callback_data=f"event_delete_{event.id}")
@@ -127,7 +127,7 @@ async def event_create_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     async with async_session_maker() as session:
         user = await UserCRUD.get_by_telegram_id(session, query.from_user.id)
-        if not user or not user.is_admin:
+        if not user or (not user.is_admin and not user.is_manager):
             await query.answer("❌ Доступ запрещен.", show_alert=True)
             return
 
@@ -273,7 +273,7 @@ async def event_delete_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     async with async_session_maker() as session:
         user = await UserCRUD.get_by_telegram_id(session, query.from_user.id)
-        if not user or not user.is_admin:
+        if not user or (not user.is_admin and not user.is_manager):
             await query.answer("❌ Доступ запрещен.", show_alert=True)
             return
 

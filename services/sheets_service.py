@@ -5,7 +5,8 @@ import json
 import logging
 import os
 from typing import Optional, List, Dict
-from datetime import datetime
+from datetime import datetime, UTC
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
@@ -152,15 +153,18 @@ class SheetsService:
 
             # Add footer
             data.append([""])
+            # Convert UTC to Moscow time for display
+            moscow_tz = ZoneInfo('Europe/Moscow')
+            export_time = datetime.now(UTC).astimezone(moscow_tz)
             data.append([
-                f"Экспортировано: {datetime.utcnow().strftime('%d.%m.%Y %H:%M UTC')}"
+                f"Экспортировано: {export_time.strftime('%d.%m.%Y %H:%M MSK')}"
             ])
 
             # Update worksheet with data
-            worksheet.update('A1', data)
+            worksheet.update(values=data, range_name='A1')
 
-            # Format the spreadsheet
-            self._format_worksheet(worksheet, len(options))
+            # Format the spreadsheet with highlighting
+            self._format_worksheet(worksheet, len(options), results)
 
             # Make spreadsheet publicly readable
             try:
@@ -178,7 +182,7 @@ class SheetsService:
             logger.error(f"Failed to export voting results: {e}")
             return None
 
-    def _format_worksheet(self, worksheet, num_options: int):
+    def _format_worksheet(self, worksheet, num_options: int, results: Dict[int, int] = None):
         """Apply formatting to the worksheet"""
         try:
             # Format header (row 1)
@@ -198,6 +202,17 @@ class SheetsService:
             worksheet.format('A3:A8', {
                 'textFormat': {'bold': True}
             })
+
+            # Highlight the option with most votes
+            if results:
+                max_votes = max(results.values()) if results else 0
+                for i, votes in results.items():
+                    if votes == max_votes and max_votes > 0:
+                        # Row 11 is the first data row (after header row 10)
+                        row_num = 11 + i
+                        worksheet.format(f'A{row_num}:C{row_num}', {
+                            'backgroundColor': {'red': 0.7, 'green': 1.0, 'blue': 0.7}
+                        })
 
             # Auto-resize columns
             worksheet.columns_auto_resize(0, 2)
@@ -286,17 +301,20 @@ class SheetsService:
 
             # Add footer
             data.append([""])
+            # Convert UTC to Moscow time for display
+            moscow_tz = ZoneInfo('Europe/Moscow')
+            update_time = datetime.now(UTC).astimezone(moscow_tz)
             data.append([
                 f"Всего членов: {len(members)}",
                 "",
                 "",
                 "",
                 "",
-                f"Обновлено: {datetime.utcnow().strftime('%d.%m.%Y %H:%M UTC')}"
+                f"Обновлено: {update_time.strftime('%d.%m.%Y %H:%M MSK')}"
             ])
 
             # Update worksheet with data
-            worksheet.update('A1', data)
+            worksheet.update(values=data, range_name='A1')
 
             # Format the spreadsheet
             self._format_registry_worksheet(worksheet, len(members))
@@ -315,6 +333,113 @@ class SheetsService:
 
         except Exception as e:
             logger.error(f"Failed to export members registry: {e}")
+            return None
+
+    async def export_all_voting_results(
+        self,
+        voting_results_list: List[Dict],
+        spreadsheet_name: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Export all voting results to a single Google Sheets file
+
+        Args:
+            voting_results_list: List of dictionaries with voting data
+            spreadsheet_name: Optional custom spreadsheet name
+
+        Returns:
+            URL to the created spreadsheet or None if failed
+        """
+        logger.info(f"export_all_voting_results called with {len(voting_results_list) if voting_results_list else 0} results")
+        logger.info(f"GSPREAD_AVAILABLE: {GSPREAD_AVAILABLE}, client initialized: {self.client is not None}")
+
+        if not GSPREAD_AVAILABLE or not self.client:
+            logger.warning("Google Sheets not available, skipping export")
+            return None
+
+        if not voting_results_list:
+            logger.warning("No voting results to export")
+            return None
+
+        try:
+            # Create spreadsheet
+            sheet_name = spreadsheet_name or f"Результаты голосования {datetime.now(UTC).strftime('%d.%m.%Y')}"
+
+            try:
+                logger.info(f"Creating spreadsheet '{sheet_name}' in folder {self.folder_id}")
+                spreadsheet = self.client.create(sheet_name, folder_id=self.folder_id)
+                logger.info(f"Created new spreadsheet: {sheet_name} (ID: {spreadsheet.id}) in folder {self.folder_id}")
+            except Exception as e:
+                logger.error(f"Failed to create spreadsheet: {e}", exc_info=True)
+                return None
+
+            # Create a worksheet for each voting question
+            for idx, result_data in enumerate(voting_results_list):
+                voting = result_data['voting']
+                options = result_data['options']
+                results = result_data['results']
+                total_votes = result_data['total_votes']
+
+                # Get or create worksheet
+                if idx == 0:
+                    worksheet = spreadsheet.sheet1
+                    worksheet.update_title(f"Вопрос 1")
+                else:
+                    worksheet = spreadsheet.add_worksheet(title=f"Вопрос {idx + 1}", rows=100, cols=20)
+
+                # Prepare data
+                data = [
+                    [f"Вопрос {idx + 1} - Результаты"],
+                    [""],
+                    ["Название:", voting.title],
+                    ["Описание:", voting.description],
+                    ["ID голосования:", str(voting.id)],
+                    ["Создано:", voting.created_at.strftime("%d.%m.%Y %H:%M")],
+                    ["Завершено:", voting.ends_at.strftime("%d.%m.%Y %H:%M")],
+                    ["Всего голосов:", str(total_votes)],
+                    [""],
+                    ["Вариант ответа", "Количество голосов", "Процент"]
+                ]
+
+                # Add results for each option
+                for i, option in enumerate(options):
+                    votes = results.get(i, 0)
+                    percent = (votes / total_votes * 100) if total_votes > 0 else 0
+                    data.append([
+                        option,
+                        str(votes),
+                        f"{percent:.1f}%"
+                    ])
+
+                # Add footer
+                data.append([""])
+                # Convert UTC to Moscow time for display
+                moscow_tz = ZoneInfo('Europe/Moscow')
+                export_time = datetime.now(UTC).astimezone(moscow_tz)
+                data.append([
+                    f"Экспортировано: {export_time.strftime('%d.%m.%Y %H:%M MSK')}"
+                ])
+
+                # Update worksheet with data
+                worksheet.update(values=data, range_name='A1')
+
+                # Format the spreadsheet with highlighting
+                self._format_worksheet(worksheet, len(options), results)
+
+            # Make spreadsheet publicly readable
+            try:
+                spreadsheet.share('', perm_type='anyone', role='reader')
+                logger.info(f"Made spreadsheet publicly readable")
+            except Exception as e:
+                logger.warning(f"Failed to make spreadsheet public: {e}")
+
+            # Return spreadsheet URL
+            url = spreadsheet.url
+            logger.info(f"All voting results exported to: {url}")
+            return url
+
+        except Exception as e:
+            logger.error(f"Failed to export all voting results: {e}", exc_info=True)
             return None
 
     def _format_registry_worksheet(self, worksheet, num_members: int):

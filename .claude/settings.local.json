@@ -30,7 +30,9 @@
       "Bash(py:*)",
       "Bash(powershell.exe -Command \"python --version\")",
       "Bash(docker system prune:*)",
-      "Bash(del token.json)"
+      "Bash(del token.json)",
+      "Bash(docker-compose:*)",
+      "Bash(docker volume:*)"
     ],
     "deny": [],
     "ask": []

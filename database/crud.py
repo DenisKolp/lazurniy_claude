@@ -183,6 +183,15 @@ class VoteCRUD:
         return result.scalar_one_or_none()
 
     @staticmethod
+    async def update(session: AsyncSession, vote: Vote, **kwargs) -> Vote:
+        """Update vote"""
+        for key, value in kwargs.items():
+            setattr(vote, key, value)
+        await session.commit()
+        await session.refresh(vote)
+        return vote
+
+    @staticmethod
     async def count_votes(session: AsyncSession, voting_id: int) -> int:
         """Count votes for voting"""
         result = await session.execute(
@@ -282,9 +291,11 @@ class TicketCRUD:
 
     @staticmethod
     async def get_by_id(session: AsyncSession, ticket_id: int) -> Optional[Ticket]:
-        """Get ticket by ID"""
+        """Get ticket by ID with user relationship loaded"""
         result = await session.execute(
-            select(Ticket).where(Ticket.id == ticket_id)
+            select(Ticket)
+            .options(selectinload(Ticket.user))
+            .where(Ticket.id == ticket_id)
         )
         return result.scalar_one_or_none()
 
