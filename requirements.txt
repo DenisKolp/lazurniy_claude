@@ -27,8 +27,14 @@ Pillow==10.1.0
 # Logging
 structlog==23.2.0
 
-# Google Sheets integration
-gspread==6.1.4
-google-auth==2.36.0
-google-auth-oauthlib==1.2.1
-google-auth-httplib2==0.2.0
+# Excel file generation
+openpyxl==3.1.2
+
+# HTTP client for Yandex Disk API
+aiohttp==3.9.1
+
+# Google Sheets integration (legacy - can be removed if not needed)
+# gspread==6.1.4
+# google-auth==2.36.0
+# google-auth-oauthlib==1.2.1
+# google-auth-httplib2==0.2.0

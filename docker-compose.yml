@@ -1,4 +1,4 @@
-version: '3.8'
+# Docker Compose configuration for Lazurny Bot
 
 services:
   postgres:
@@ -28,8 +28,11 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+      # Google Sheets (legacy - optional)
       - ./credentials.json:/app/credentials.json:ro
       - ./token.json:/app/token.json:ro
+      # Yandex Disk token (optional - can use env var instead)
+      - ./yandex_token.txt:/app/yandex_token.txt:ro
     environment:
       - DATABASE_URL=postgresql+asyncpg://lazurny_user:${POSTGRES_PASSWORD:-lazurny_secure_pass_2024}@postgres:5432/lazurny_bot
     networks:

@@ -14,7 +14,7 @@ from database.crud import UserCRUD, VotingCRUD, EventCRUD, TicketCRUD
 from database.models import UserStatus, TicketStatus, VotingStatus
 from database.session import async_session_maker
 from utils.helpers import format_datetime, get_user_display_name
-from services.sheets_service import sheets_service
+from services.yandex_disk_service import yandex_disk_service
 from config import config
 import json
 from datetime import timedelta
@@ -328,7 +328,7 @@ async def admin_approve_callback(update: Update, context: ContextTypes.DEFAULT_T
             verified_at=datetime.utcnow()
         )
 
-        # Export updated registry to Google Sheets
+        # Export updated registry to Yandex Disk
         try:
             verified_users = await UserCRUD.get_all_verified(session)
             members_data = []
@@ -341,9 +341,9 @@ async def admin_approve_callback(update: Update, context: ContextTypes.DEFAULT_T
                     'verified_at': format_datetime(member.verified_at, '%d.%m.%Y %H:%M') if member.verified_at else 'Не указана'
                 })
 
-            registry_url = await sheets_service.export_members_registry(members_data)
+            registry_url = await yandex_disk_service.export_members_registry(members_data)
             if registry_url:
-                logger.info(f"Registry exported to Google Sheets: {registry_url}")
+                logger.info(f"Registry exported to Yandex Disk: {registry_url}")
         except Exception as e:
             logger.error(f"Failed to export registry: {e}")
 
@@ -417,6 +417,25 @@ async def admin_reject_reason(update: Update, context: ContextTypes.DEFAULT_TYPE
             status=UserStatus.REJECTED,
             rejected_reason=reason
         )
+
+        # Update registry on Yandex Disk (remove this user if they were verified)
+        try:
+            verified_users = await UserCRUD.get_all_verified(session)
+            members_data = []
+            for member in verified_users:
+                members_data.append({
+                    'full_name': member.full_name,
+                    'username': member.username,
+                    'phone_number': member.phone_number,
+                    'address': member.address,
+                    'verified_at': format_datetime(member.verified_at, '%d.%m.%Y %H:%M') if member.verified_at else 'Не указана'
+                })
+
+            registry_url = await yandex_disk_service.export_members_registry(members_data)
+            if registry_url:
+                logger.info(f"Registry updated (user rejected) on Yandex Disk: {registry_url}")
+        except Exception as e:
+            logger.error(f"Failed to update registry after rejection: {e}")
 
         # Notify user
         try:
@@ -548,9 +567,9 @@ async def admin_revoke_callback(update: Update, context: ContextTypes.DEFAULT_TY
                     'verified_at': format_datetime(member.verified_at, '%d.%m.%Y %H:%M') if member.verified_at else 'Не указана'
                 })
 
-            registry_url = await sheets_service.export_members_registry(members_data)
+            registry_url = await yandex_disk_service.export_members_registry(members_data)
             if registry_url:
-                logger.info(f"Registry updated (user removed) in Google Sheets: {registry_url}")
+                logger.info(f"Registry updated (user removed) on Yandex Disk: {registry_url}")
         except Exception as e:
             logger.error(f"Failed to update registry: {e}")
 
@@ -1069,7 +1088,7 @@ async def admin_voting_draft_view_callback(update: Update, context: ContextTypes
         text += f"Создано: {created}\n"
 
         keyboard = [
-            [InlineKeyboardButton("✅ Опубликовать", callback_data=f"admin_voting_publish_duration_{voting_id}")],
+            [InlineKeyboardButton("✅ Опубликовать", callback_data=f"admin_voting_publish_{voting_id}")],
             [InlineKeyboardButton("❌ Отклонить", callback_data=f"admin_voting_reject_{voting_id}")],
             [InlineKeyboardButton("◀️ Назад", callback_data="admin_votings_draft")]
         ]
@@ -1262,9 +1281,7 @@ async def admin_voting_publish_callback(update: Update, context: ContextTypes.DE
     # Show immediate feedback
     await query.answer("⏳ Публикую вопрос и отправляю уведомления...", show_alert=False)
 
-    parts = query.data.split("_")
-    voting_id = int(parts[3])
-    duration_days = int(parts[4])
+    voting_id = int(query.data.split("_")[-1])
 
     async with async_session_maker() as session:
         voting = await VotingCRUD.get_by_id(session, voting_id)
@@ -1274,7 +1291,8 @@ async def admin_voting_publish_callback(update: Update, context: ContextTypes.DE
 
         # Update status to ACTIVE and set proper dates
         starts_at = datetime.utcnow()
-        ends_at = starts_at + timedelta(days=duration_days)
+        # Set far future date (will be closed manually by admin)
+        ends_at = starts_at + timedelta(days=365)
 
         await VotingCRUD.update(
             session,
@@ -1290,7 +1308,7 @@ async def admin_voting_publish_callback(update: Update, context: ContextTypes.DE
                 chat_id=voting.creator.telegram_id,
                 text=f"✅ Ваш вопрос одобрен и опубликован!\n\n"
                      f"*{voting.title}*\n\n"
-                     f"Голосование будет активно до {format_datetime(ends_at)}.",
+                     f"Голосование будет открыто до тех пор, пока администратор не закроет его вручную.",
                 parse_mode='Markdown'
             )
         except Exception:
@@ -1307,7 +1325,6 @@ async def admin_voting_publish_callback(update: Update, context: ContextTypes.DE
                     text = f"🗳️ *Новое голосование!*\n\n"
                     text += f"*{voting.title}*\n\n"
                     text += f"{voting.description}\n\n"
-                    text += f"Завершается: {format_datetime(ends_at)}\n\n"
                     text += "*Варианты ответов:*\n"
                     for i, option in enumerate(options):
                         text += f"{i+1}. {option}\n"
@@ -1503,7 +1520,6 @@ def register_admin_handlers(application):
     application.add_handler(CallbackQueryHandler(admin_votings_active_callback, pattern="^admin_votings_active$"))
     application.add_handler(CallbackQueryHandler(admin_voting_draft_view_callback, pattern="^admin_voting_draft_"))
     application.add_handler(CallbackQueryHandler(admin_voting_active_view_callback, pattern="^admin_voting_active_"))
-    application.add_handler(CallbackQueryHandler(admin_voting_publish_duration_callback, pattern="^admin_voting_publish_duration_"))
     application.add_handler(CallbackQueryHandler(admin_voting_publish_callback, pattern="^admin_voting_publish_"))
     application.add_handler(CallbackQueryHandler(admin_voting_reject_callback, pattern="^admin_voting_reject_"))
     application.add_handler(CallbackQueryHandler(admin_voting_delete_callback, pattern="^admin_voting_delete_"))

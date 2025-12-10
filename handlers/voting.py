@@ -10,10 +10,10 @@ from telegram.ext import (
 from database.crud import UserCRUD, VotingCRUD, VoteCRUD
 from database.models import UserStatus, VotingStatus
 from database.session import async_session_maker
-from utils.validators import validate_title, validate_description, validate_voting_options
+from utils.validators import validate_title, validate_description
 from utils.helpers import format_datetime, calculate_quorum, format_voting_results, get_user_display_name
 from config import config
-from services.sheets_service import sheets_service
+from services.yandex_disk_service import yandex_disk_service
 import json
 import asyncio
 import logging
@@ -22,8 +22,8 @@ logger = logging.getLogger(__name__)
 
 
 # Conversation states
-VOTING_TITLE, VOTING_DESCRIPTION, VOTING_OPTIONS, VOTING_DURATION = range(4)
-PROPOSE_DESCRIPTION, PROPOSE_OPTIONS = range(4, 6)
+VOTING_TITLE, VOTING_DESCRIPTION = range(2)
+PROPOSE_DESCRIPTION = 2
 
 
 async def voting_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -482,11 +482,11 @@ async def voting_end_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 'total_votes': total_votes
             })
 
-        # Export all results to a single Google Sheets file
+        # Export all results to a single Excel file on Yandex Disk
         sheets_url = None
         try:
-            logger.info(f"Exporting {len(all_voting_results)} voting results to Google Sheets...")
-            sheets_url = await sheets_service.export_all_voting_results(all_voting_results)
+            logger.info(f"Exporting {len(all_voting_results)} voting results to Yandex Disk...")
+            sheets_url = await yandex_disk_service.export_all_voting_results(all_voting_results)
             if sheets_url:
                 logger.info(f"Successfully exported voting results to: {sheets_url}")
             else:
@@ -587,7 +587,7 @@ async def voting_create_start(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await query.edit_message_text(
         "📝 *Создание голосования*\n\n"
-        "Шаг 1/4: Введите название голосования:",
+        "Шаг 1/2: Введите название голосования:",
         parse_mode='Markdown'
     )
     return VOTING_TITLE
@@ -606,7 +606,8 @@ async def voting_receive_title(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data['voting_title'] = title
     await update.message.reply_text(
         "✅ Название сохранено!\n\n"
-        "Шаг 2/4: Введите описание голосования:"
+        "Шаг 2/2: Введите описание голосования:\n\n"
+        "Варианты ответа будут автоматически установлены: ЗА / ПРОТИВ"
     )
     return VOTING_DESCRIPTION
 
@@ -622,54 +623,16 @@ async def voting_receive_description(update: Update, context: ContextTypes.DEFAU
         return VOTING_DESCRIPTION
 
     context.user_data['voting_description'] = description
-    await update.message.reply_text(
-        "✅ Описание сохранено!\n\n"
-        "Шаг 3/4: Введите варианты ответов (каждый с новой строки, минимум 2):\n\n"
-        "Пример:\n"
-        "За\n"
-        "Против\n"
-        "Воздержался"
-    )
-    return VOTING_OPTIONS
+    # Set fixed options: ЗА and ПРОТИВ
+    context.user_data['voting_options'] = ["ЗА", "ПРОТИВ"]
 
-
-async def voting_receive_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive voting options"""
-    options = [opt.strip() for opt in update.message.text.split('\n') if opt.strip()]
-
-    if not validate_voting_options(options):
-        await update.message.reply_text(
-            "❌ Необходимо от 2 до 10 вариантов. Попробуйте еще раз:"
-        )
-        return VOTING_OPTIONS
-
-    context.user_data['voting_options'] = options
-    await update.message.reply_text(
-        "✅ Варианты сохранены!\n\n"
-        f"Шаг 4/4: Введите длительность голосования в днях (по умолчанию {config.VOTE_DURATION_DAYS}):"
-    )
-    return VOTING_DURATION
-
-
-async def voting_receive_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive voting duration and create voting"""
-    duration_text = update.message.text.strip()
-
-    try:
-        duration_days = int(duration_text)
-        if duration_days < 1 or duration_days > 30:
-            raise ValueError()
-    except ValueError:
-        await update.message.reply_text(
-            "❌ Длительность должна быть от 1 до 30 дней. Попробуйте еще раз:"
-        )
-        return VOTING_DURATION
-
+    # Create voting immediately without setting end date
     async with async_session_maker() as session:
         user = await UserCRUD.get_by_telegram_id(session, update.effective_user.id)
 
         starts_at = datetime.utcnow()
-        ends_at = starts_at + timedelta(days=duration_days)
+        # Set far future date (will be closed manually by admin)
+        ends_at = datetime.utcnow() + timedelta(days=365)
 
         voting = await VotingCRUD.create(
             session,
@@ -684,25 +647,27 @@ async def voting_receive_duration(update: Update, context: ContextTypes.DEFAULT_
         )
 
     await update.message.reply_text(
-        f"✅ Голосование создано!\n\n"
-        f"ID: {voting.id}\n"
-        f"Название: {voting.title}\n"
-        f"Завершится: {format_datetime(ends_at)}\n\n"
-        "Голосование активно и доступно всем участникам."
+        "✅ Голосование создано и активировано!\n\n"
+        f"*{voting.title}*\n\n"
+        f"{voting.description[:200]}{'...' if len(voting.description) > 200 else ''}\n\n"
+        "Варианты: ЗА / ПРОТИВ\n\n"
+        "Голосование будет открыто до тех пор, пока администратор не закроет его вручную.",
+        parse_mode='Markdown'
     )
 
-    # Notify all association members
+    # Notify all verified users about new voting
     async with async_session_maker() as session:
-        verified_users = await UserCRUD.get_all_verified(session)
-        for verified_user in verified_users:
-            if verified_user.notifications_enabled and verified_user.telegram_id != user.telegram_id:
+        all_users = await UserCRUD.get_all_verified(session)
+
+        for member in all_users:
+            if member.notifications_enabled and member.telegram_id != update.effective_user.id:
                 try:
                     await context.bot.send_message(
-                        chat_id=verified_user.telegram_id,
-                        text=f"🗳️ Новое голосование!\n\n"
+                        chat_id=member.telegram_id,
+                        text=f"🔔 Новое голосование!\n\n"
                              f"*{voting.title}*\n\n"
-                             f"{voting.description[:200]}...\n\n"
-                             f"Используйте команду /voting для участия.",
+                             f"{voting.description[:200]}{'...' if len(voting.description) > 200 else ''}\n\n"
+                             f"Перейдите в раздел 'Голосования' для участия.",
                         parse_mode='Markdown'
                     )
                 except Exception:
@@ -710,6 +675,12 @@ async def voting_receive_duration(update: Update, context: ContextTypes.DEFAULT_
 
     context.user_data.clear()
     return ConversationHandler.END
+
+
+# Function removed - voting options are now fixed as "ЗА" and "ПРОТИВ"
+
+
+# Function removed - voting duration is no longer needed, votings are closed manually by admin
 
 
 async def voting_propose_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -725,7 +696,8 @@ async def voting_propose_callback(update: Update, context: ContextTypes.DEFAULT_
 
     await query.edit_message_text(
         "➕ *Предложить вопрос для голосования*\n\n"
-        "Шаг 1/2: Введите описание вопроса:",
+        "Введите текст вопроса:\n\n"
+        "Варианты ответа будут автоматически установлены: ЗА / ПРОТИВ",
         parse_mode='Markdown'
     )
     return PROPOSE_DESCRIPTION
@@ -737,37 +709,21 @@ async def propose_receive_description(update: Update, context: ContextTypes.DEFA
 
     if not validate_description(description):
         await update.message.reply_text(
-            "❌ Описание должно быть от 10 до 4000 символов. Попробуйте еще раз:"
+            "❌ Текст вопроса должен быть от 10 до 4000 символов. Попробуйте еще раз:"
         )
         return PROPOSE_DESCRIPTION
 
     context.user_data['propose_description'] = description
-    await update.message.reply_text(
-        "✅ Описание сохранено!\n\n"
-        "Шаг 2/2: Введите варианты ответов (каждый с новой строки, минимум 2):\n\n"
-        "Пример:\n"
-        "За\n"
-        "Против\n"
-        "Воздержался"
-    )
-    return PROPOSE_OPTIONS
 
+    # Set fixed options and create draft voting immediately
+    options = ["ЗА", "ПРОТИВ"]
 
-async def propose_receive_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive proposed question options and create draft voting"""
-    options = [opt.strip() for opt in update.message.text.split('\n') if opt.strip()]
-
-    if not validate_voting_options(options):
-        await update.message.reply_text(
-            "❌ Необходимо от 2 до 10 вариантов. Попробуйте еще раз:"
-        )
-        return PROPOSE_OPTIONS
-
+    # Get user info first
     async with async_session_maker() as session:
         user = await UserCRUD.get_by_telegram_id(session, update.effective_user.id)
+        user_display_name = get_user_display_name(user)
 
         # Use description as title (first 100 chars) since we removed title step
-        description = context.user_data['propose_description']
         title = description[:100] + ('...' if len(description) > 100 else '')
 
         # Create draft voting (not active yet)
@@ -786,30 +742,36 @@ async def propose_receive_options(update: Update, context: ContextTypes.DEFAULT_
     await update.message.reply_text(
         f"✅ Вопрос предложен!\n\n"
         f"{voting.description[:200]}{'...' if len(voting.description) > 200 else ''}\n\n"
+        f"Варианты ответа: ЗА / ПРОТИВ\n\n"
         "Ваш вопрос отправлен на модерацию администраторам.\n"
         "После одобрения он будет опубликован для всех участников."
     )
 
     # Notify admins about new proposed question
     async with async_session_maker() as session:
-        all_users = await UserCRUD.get_all_verified(session)
-        admin_users = [u for u in all_users if u.is_admin]
+        # Get all users and filter admins (admins can have any status)
+        from database.models import User
+        from sqlalchemy import select
+        result = await session.execute(select(User).where(User.is_admin == True))
+        admin_users = result.scalars().all()
 
         for admin in admin_users:
             try:
                 await context.bot.send_message(
                     chat_id=admin.telegram_id,
-                    text=f"📝 Новый вопрос на модерацию!\n\n"
-                         f"*{voting.title}*\n\n"
-                         f"От: {get_user_display_name(user)}\n\n"
-                         f"Перейдите в админ-панель для модерации.",
-                    parse_mode='Markdown'
+                    text=f"🔔 Новый вопрос для голосования!\n\n"
+                         f"От: {user_display_name}\n"
+                         f"Вопрос: {voting.description[:200]}{'...' if len(voting.description) > 200 else ''}\n\n"
+                         f"Используйте /admin для просмотра и одобрения."
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"Failed to notify admin {admin.telegram_id}: {e}")
 
     context.user_data.clear()
     return ConversationHandler.END
+
+
+# Function removed - voting options are now fixed as "ЗА" and "ПРОТИВ"
 
 
 async def voting_my_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -952,12 +914,6 @@ def register_voting_handlers(application):
             VOTING_DESCRIPTION: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, voting_receive_description)
             ],
-            VOTING_OPTIONS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, voting_receive_options)
-            ],
-            VOTING_DURATION: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, voting_receive_duration)
-            ],
         },
         fallbacks=[],
         allow_reentry=True,
@@ -971,9 +927,6 @@ def register_voting_handlers(application):
         states={
             PROPOSE_DESCRIPTION: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, propose_receive_description)
-            ],
-            PROPOSE_OPTIONS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, propose_receive_options)
             ],
         },
         fallbacks=[],
